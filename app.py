@@ -2,11 +2,13 @@
 
 Scholar is a session-scoped academic PDF assistant using:
 
-    PDF extraction      -> local
+    PDF extraction      -> local (with tables + figures)
     Section-aware chunks -> local
     Embeddings          -> local SentenceTransformer
-    Vector retrieval    -> local Chroma
+    Cross-encoder rerank-> local (neural precision scoring)
+    Vector retrieval    -> local Chroma (persistent)
     Keyword retrieval   -> local BM25
+    Faithfulness eval   -> Gemini (opt-in)
     Answer generation   -> Google Gemini only when requested
 
 No document contents are intentionally sent to any external service other
@@ -16,6 +18,7 @@ than the Gemini API during an explicit generation request.
 from __future__ import annotations
 
 import html
+import re  # NEW: for detecting table chunks
 from dataclasses import dataclass
 from typing import Any
 
@@ -54,10 +57,10 @@ EXAMPLE_QUESTIONS = [
 ]
 
 PROCESSING_STEPS = [
-    "Extracting text from PDF",
+    "Extracting text, tables, and figures from PDF",
     "Chunking by academic sections",
     "Loading local embedding model",
-    "Building hybrid search index",
+    "Building hybrid search index (dense + sparse)",
 ]
 
 
@@ -71,6 +74,7 @@ class _SourceRefs:
 
     chunks: list[str]
     indices: list[int]
+    scores: list[float] | None = None  # NEW: cross-encoder scores
 
 
 # ---------------------------------------------------------------------------
@@ -282,6 +286,36 @@ def _inject_styles(dark_mode: bool) -> None:
                 margin: 0.25rem 0.35rem 0.25rem 0;
             }}
 
+            /* NEW: Faithfulness score badge styling */
+            .faith-badge {{
+                display: inline-flex;
+                align-items: center;
+                gap: 0.35rem;
+                padding: 0.25rem 0.6rem;
+                border-radius: 6px;
+                font-size: 0.8rem;
+                font-weight: 600;
+                margin: 0.5rem 0;
+            }}
+
+            .faith-high {{
+                background: {status_ready_bg};
+                color: {status_ready_text};
+                border: 1px solid {status_ready_border};
+            }}
+
+            .faith-medium {{
+                background: #fef3c7;
+                color: #92400e;
+                border: 1px solid #f59e0b;
+            }}
+
+            .faith-low {{
+                background: #fee2e2;
+                color: #991b1b;
+                border: 1px solid #ef4444;
+            }}
+
             div[data-testid="stMetric"] {{
                 background: {metric_bg};
                 border: 1px solid {border};
@@ -464,6 +498,9 @@ def _init_session_state() -> None:
         "last_filename": "",
         "dark_mode": False,
         "processing": False,
+        # NEW: Evaluation toggles (opt-in to save API quota)
+        "evaluate_faithfulness": False,
+        "show_retrieval_details": False,
     }
 
     for key, value in defaults.items():
@@ -501,11 +538,54 @@ def _format_source_label(indices: list[int]) -> str:
     return f"Based on {noun} {joined}"
 
 
+# NEW: Detect if a chunk contains a table and format it nicely
+def _format_chunk_for_display(chunk: str) -> str:
+    """Format a chunk for safe display, handling tables specially."""
+    # Check if this chunk contains a table marker
+    if "[Table" in chunk and "|" in chunk:
+        # Extract the table portion
+        lines = chunk.split("\n")
+        table_lines = []
+        other_lines = []
+        in_table = False
+
+        for line in lines:
+            if "[Table" in line:
+                in_table = True
+                table_lines.append(line)
+            elif in_table and ("|" in line or line.strip() == ""):
+                table_lines.append(line)
+            elif in_table:
+                in_table = False
+                other_lines.append(line)
+            else:
+                other_lines.append(line)
+
+        # Format table as markdown code block for readability
+        formatted = "\n".join(other_lines)
+        if table_lines:
+            table_text = "\n".join(table_lines)
+            formatted += f"\n\n```\n{table_text}\n```"
+        return formatted
+
+    return chunk
+
+
+# NEW: Extract section name from a chunk for display
+def _extract_display_section(chunk: str) -> str:
+    """Extract the section name from a chunk prefix."""
+    match = re.match(r"\[Section:\s*(.*?)\]\s*", chunk, re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    return "Document"
+
+
 def _render_source_citations(
     indices: list[int],
     chunks: list[str],
+    scores: list[float] | None = None,
 ) -> None:
-    """Render retrieved source chunks safely."""
+    """Render retrieved source chunks safely with section names and scores."""
 
     if not indices:
         return
@@ -521,20 +601,69 @@ def _render_source_citations(
         for position, (idx, chunk) in enumerate(
             zip(indices, chunks)
         ):
-            st.markdown(f"**Section {idx}**")
+            section_name = _extract_display_section(chunk)
+            score_text = ""
+            if scores and position < len(scores):
+                score_text = f" · Score: {scores[position]:.3f}"
 
-            preview = chunk[:700]
+            st.markdown(
+                f"**Section {idx}** · *{section_name}*{score_text}"
+            )
 
-            if len(chunk) > 700:
+            # NEW: Format tables nicely
+            display_chunk = _format_chunk_for_display(chunk)
+            preview = display_chunk[:800]
+
+            if len(display_chunk) > 800:
                 preview += "…"
 
-            # Escape HTML while preserving normal markdown blockquote display.
+            # Escape HTML while preserving normal markdown
             safe_preview = html.escape(preview)
 
             st.markdown(f"> {safe_preview}")
 
             if position < len(indices) - 1:
                 st.divider()
+
+
+# NEW: Render faithfulness evaluation results
+def _render_faithfulness(faithfulness: dict[str, Any] | None) -> None:
+    """Display faithfulness score and claim details."""
+    if not faithfulness:
+        return
+
+    score = faithfulness.get("faithfulness_score", 0.0)
+    total = faithfulness.get("total_claims", 0)
+    supported = faithfulness.get("supported_claims", 0)
+    unsupported = faithfulness.get("unsupported_claims", [])
+    explanation = faithfulness.get("explanation", "")
+
+    # Determine badge class
+    if score >= 0.8:
+        badge_class = "faith-high"
+        label = "● High Faithfulness"
+    elif score >= 0.5:
+        badge_class = "faith-medium"
+        label = "● Medium Faithfulness"
+    else:
+        badge_class = "faith-low"
+        label = "● Low Faithfulness"
+
+    st.markdown(
+        f"""
+        <div class="faith-badge {badge_class}">
+            {label} · {score:.0%} ({supported}/{total} claims)
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if unsupported:
+        with st.expander(f"⚠️ {len(unsupported)} unsupported claim(s)"):
+            for claim in unsupported:
+                st.markdown(f"- {html.escape(claim)}")
+            if explanation:
+                st.caption(explanation)
 
 
 def _render_empty_state(
@@ -571,14 +700,14 @@ def _resolve_answer_result(
     )
 
     if hasattr(result, "answer") and hasattr(result, "sources"):
-        return result.answer, result.sources
+        return result.answer, result.sources, getattr(result, "faithfulness", None)
 
     # Defensive fallback for older pipeline objects.
     answer = str(result)
     sources = pipeline.retrieve(question)
 
     if hasattr(sources, "indices"):
-        return answer, sources
+        return answer, sources, None
 
     chunks = list(sources)
 
@@ -588,11 +717,13 @@ def _resolve_answer_result(
             chunks=chunks,
             indices=list(range(1, len(chunks) + 1)),
         ),
+        None,
     )
 
 
+# NEW: Generate response with optional faithfulness evaluation
 def _generate_assistant_response(question: str) -> None:
-    """Generate one grounded response for the latest user question."""
+    """Generate one grounded response with optional evaluation."""
 
     pipeline = st.session_state.pipeline
 
@@ -613,63 +744,142 @@ def _generate_assistant_response(question: str) -> None:
 
         status = st.empty()
 
-        status.markdown(
-            '<p class="typing-indicator">'
-            "Retrieving relevant sections…"
-            "</p>",
-            unsafe_allow_html=True,
-        )
+        # NEW: Check if evaluation mode is enabled
+        evaluate_mode = st.session_state.get("evaluate_faithfulness", False)
 
-        try:
-
-            stream_iter, sources = pipeline.stream_answer_question(
-                question,
-                api_key,
-                top_k=4,
-            )
-
+        if evaluate_mode:
+            # Evaluation mode: non-streaming, but with quality metrics
             status.markdown(
                 '<p class="typing-indicator">'
-                "Scholar is thinking…"
+                "Retrieving and evaluating answer quality…"
                 "</p>",
                 unsafe_allow_html=True,
             )
 
-            answer = st.write_stream(stream_iter)
+            try:
+                result = pipeline.answer_question(
+                    question,
+                    api_key,
+                    top_k=4,
+                    evaluate=True,
+                )
 
-            status.empty()
+                answer = result.answer
+                sources = result.sources
+                faithfulness = result.faithfulness
 
-            if not answer:
-                st.warning(
-                    "The AI service returned an empty response. "
+                status.empty()
+
+                if not answer:
+                    st.warning(
+                        "The AI service returned an empty response. "
+                        "Please try again."
+                    )
+                    return
+
+                st.markdown(answer)
+
+                # NEW: Display faithfulness metrics
+                _render_faithfulness(faithfulness)
+
+                # NEW: Display retrieval details if enabled
+                if st.session_state.get("show_retrieval_details", False):
+                    with st.expander("🔍 Retrieval Details"):
+                        st.markdown("**Pipeline stages used:**")
+                        st.markdown("- Dense semantic retrieval (ChromaDB)")
+                        st.markdown("- Sparse keyword retrieval (BM25)")
+                        st.markdown("- Reciprocal Rank Fusion (RRF)")
+                        st.markdown("- Cross-encoder neural re-ranking")
+                        st.markdown("- Diversity filter (Jaccard similarity)")
+
+                _render_source_citations(
+                    sources.indices,
+                    sources.chunks,
+                    getattr(sources, "scores", None),
+                )
+
+                # Store in history with evaluation data
+                st.session_state.chat_history.append(
+                    {
+                        "role": "assistant",
+                        "content": str(answer),
+                        "source_indices": list(sources.indices),
+                        "source_chunks": list(sources.chunks),
+                        "faithfulness": faithfulness,
+                    }
+                )
+
+            except RAGPipelineError as exc:
+                status.empty()
+                st.error(str(exc))
+
+            except Exception:
+                status.empty()
+                st.error(
+                    "Could not generate an answer. "
                     "Please try again."
                 )
-                return
 
-            _render_source_citations(
-                sources.indices,
-                sources.chunks,
+        else:
+            # Standard mode: streaming for responsiveness
+            status.markdown(
+                '<p class="typing-indicator">'
+                "Retrieving relevant sections…"
+                "</p>",
+                unsafe_allow_html=True,
             )
 
-            st.session_state.chat_history.append(
-                {
-                    "role": "assistant",
-                    "content": str(answer),
-                    "source_indices": list(sources.indices),
-                    "source_chunks": list(sources.chunks),
-                }
-            )
+            try:
+                stream_iter, sources = pipeline.stream_answer_question(
+                    question,
+                    api_key,
+                    top_k=4,
+                )
 
-        except RAGPipelineError as exc:
-            status.empty()
-            st.error(str(exc))
+                status.markdown(
+                    '<p class="typing-indicator">'
+                    "Scholar is thinking…"
+                    "</p>",
+                    unsafe_allow_html=True,
+                )
 
-        except Exception:
-            status.empty()
-            st.error(
-                "Could not generate an answer. "
-                "Please try again."
-            )
+                answer = st.write_stream(stream_iter)
+
+                status.empty()
+
+                if not answer:
+                    st.warning(
+                        "The AI service returned an empty response. "
+                        "Please try again."
+                    )
+                    return
+
+                _render_source_citations(
+                    sources.indices,
+                    sources.chunks,
+                    getattr(sources, "scores", None),
+                )
+
+                st.session_state.chat_history.append(
+                    {
+                        "role": "assistant",
+                        "content": str(answer),
+                        "source_indices": list(sources.indices),
+                        "source_chunks": list(sources.chunks),
+                        "faithfulness": None,
+                    }
+                )
+
+            except RAGPipelineError as exc:
+                status.empty()
+                st.error(str(exc))
+
+            except Exception:
+                status.empty()
+                st.error(
+                    "Could not generate an answer. "
+                    "Please try again."
+                )
 
 
 def _chat_needs_response() -> bool:
@@ -709,7 +919,7 @@ def _submit_user_message(question: str) -> None:
 # ---------------------------------------------------------------------------
 
 def _render_chat_message(message: dict[str, Any]) -> None:
-    """Render one chat message."""
+    """Render one chat message with optional faithfulness display."""
 
     role = message.get("role", "assistant")
 
@@ -732,6 +942,10 @@ def _render_chat_message(message: dict[str, Any]) -> None:
                 message["source_indices"],
                 message.get("source_chunks", []),
             )
+
+        # NEW: Show faithfulness for past messages too
+        if role == "assistant" and message.get("faithfulness"):
+            _render_faithfulness(message["faithfulness"])
 
 
 def _render_chat_welcome() -> None:
@@ -952,6 +1166,12 @@ def _process_pdf(
         st.session_state.last_filename = uploaded_file.name
         st.session_state.failed_file_key = ""
 
+        # NEW: Count tables and figures for metrics
+        table_count = sum(1 for c in chunks if "[Table" in c)
+        figure_count = sum(1 for c in chunks if "[Figure" in c)
+        st.session_state["table_count"] = table_count
+        st.session_state["figure_count"] = figure_count
+
         st.success(
             f"Document indexed successfully — "
             f"{len(chunks):,} chunks ready for analysis."
@@ -1012,6 +1232,20 @@ def _render_sidebar() -> None:
         st.toggle(
             "Dark mode",
             key="dark_mode",
+        )
+
+        # NEW: Evaluation toggle (opt-in to save API quota)
+        st.toggle(
+            "Evaluate answer faithfulness",
+            key="evaluate_faithfulness",
+            help="Uses one extra Gemini call per answer to verify claims against sources. Enable when testing quality.",
+        )
+
+        # NEW: Retrieval details toggle
+        st.toggle(
+            "Show retrieval details",
+            key="show_retrieval_details",
+            help="Display technical information about which retrieval stages were used.",
         )
 
         if st.session_state.pdf_processed:
@@ -1106,14 +1340,21 @@ def _render_sidebar() -> None:
 
         st.divider()
 
+        # NEW: Updated about box mentioning advanced features
         st.markdown(
             """
             <div class="about-box">
                 <strong>About Scholar</strong><br><br>
                 Local embeddings + Chroma vector search +
-                BM25 keyword retrieval + Gemini generation.
-                <br><br>
-                PDFs and embeddings remain session-scoped.
+                BM25 keyword retrieval + <strong>Cross-encoder re-ranking</strong>
+                + Gemini generation.<br><br>
+                <strong>Advanced features:</strong><br>
+                • Section-aware chunking<br>
+                • Table & figure extraction<br>
+                • Query decomposition<br>
+                • Faithfulness evaluation<br>
+                • Persistent vector storage<br><br>
+                PDFs and embeddings remain local.
                 Gemini is only called when you explicitly
                 request an AI-generated response.
             </div>
@@ -1132,7 +1373,8 @@ def _render_document_metrics() -> None:
     if not st.session_state.pdf_processed:
         return
 
-    col1, col2, col3 = st.columns(3)
+    # NEW: 4 columns instead of 3 to show tables/figures
+    col1, col2, col3, col4 = st.columns(4)
 
     filename = st.session_state.get(
         "last_filename",
@@ -1142,24 +1384,30 @@ def _render_document_metrics() -> None:
     with col1:
         st.metric(
             "Document",
-            filename[:28]
-            + ("…" if len(filename) > 28 else ""),
+            filename[:20]
+            + ("…" if len(filename) > 20 else ""),
         )
 
     with col2:
         st.metric(
-            "Text Sections",
+            "Chunks",
             f"{len(st.session_state.chunks):,}",
         )
 
     with col3:
-        character_count = len(
-            st.session_state.full_text
+        # NEW: Show table count if available
+        table_count = st.session_state.get("table_count", 0)
+        st.metric(
+            "Tables",
+            f"{table_count}",
         )
 
+    with col4:
+        # NEW: Show figure count if available
+        figure_count = st.session_state.get("figure_count", 0)
         st.metric(
-            "Characters Extracted",
-            f"{character_count:,}",
+            "Figures",
+            f"{figure_count}",
         )
 
 
@@ -1498,8 +1746,8 @@ def main() -> None:
 
     st.markdown(
         '<p class="scholar-footer">'
-        "Scholar · Hybrid RAG · "
-        "Local Vector + BM25 Retrieval"
+        "Scholar · Advanced Hybrid RAG · "
+        "Dense + Sparse + Cross-Encoder + Faithfulness Eval"
         "</p>",
         unsafe_allow_html=True,
     )

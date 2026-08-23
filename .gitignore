@@ -17,3 +17,6 @@ Thumbs.db
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local ChromaDB vector database
+chroma_db/

@@ -51,6 +51,51 @@ _SECTION_PATTERN = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 
+# NEW: Common academic abbreviations that end with periods.
+# These are protected during sentence splitting so they don't create
+# false sentence boundaries (e.g., "et al. The next sentence").
+_PROTECTED_ABBREVS = [
+    "et al",
+    "i.e",
+    "e.g",
+    "cf",
+    "vs",
+    "dr",
+    "prof",
+    "mr",
+    "mrs",
+    "ms",
+    "fig",
+    "sec",
+    "eq",
+    "vol",
+    "no",
+    "pp",
+]
+
+
+def _protect_abbreviations(text: str) -> str:
+    """Replace abbreviation periods with placeholders to prevent false splits."""
+    protected = text
+    for i, abbr in enumerate(_PROTECTED_ABBREVS):
+        # Match abbreviation followed by period, case-insensitive
+        pattern = rf"\b{abbr}\."
+        protected = re.sub(
+            pattern,
+            f"{{ABBR{i}}}",
+            protected,
+            flags=re.IGNORECASE,
+        )
+    return protected
+
+
+def _restore_abbreviations(text: str) -> str:
+    """Restore abbreviation placeholders back to original form."""
+    restored = text
+    for i, abbr in enumerate(_PROTECTED_ABBREVS):
+        restored = restored.replace(f"{{ABBR{i}}}", f"{abbr}.")
+    return restored
+
 
 def _clean_page_text(text: str) -> str:
     """Normalize common PDF extraction artifacts."""
@@ -69,13 +114,13 @@ def _clean_page_text(text: str) -> str:
 
 
 def extract_text_from_pdf(pdf_source: BinaryIO | str) -> str:
-    """Extract readable text from a PDF.
+    """Extract readable text from a PDF including tables and metadata.
 
     Args:
         pdf_source: File-like object or path to PDF.
 
     Returns:
-        Full extracted document text.
+        Full extracted document text with tables inline.
 
     Raises:
         PDFProcessingError: If the PDF cannot be read or contains no text.
@@ -87,6 +132,20 @@ def extract_text_from_pdf(pdf_source: BinaryIO | str) -> str:
                     "The uploaded PDF appears to be empty or has no readable pages."
                 )
 
+            # NEW: Extract document metadata (title, authors, etc.)
+            metadata = pdf.metadata or {}
+            title = metadata.get("Title", "")
+            author = metadata.get("Author", "")
+
+            meta_header = ""
+            if title or author:
+                parts = []
+                if title:
+                    parts.append(f"[Title: {title}]")
+                if author:
+                    parts.append(f"[Authors: {author}]")
+                meta_header = "\n".join(parts) + "\n\n"
+
             page_texts: list[str] = []
 
             for page_number, page in enumerate(pdf.pages, start=1):
@@ -97,10 +156,54 @@ def extract_text_from_pdf(pdf_source: BinaryIO | str) -> str:
 
                 text = _clean_page_text(text)
 
+                # NEW: Extract tables from the page
+                table_texts: list[str] = []
+                try:
+                    tables = page.find_tables()
+                    for t_idx, table in enumerate(tables, start=1):
+                        df = table.to_pandas()
+                        table_str = df.to_string(index=False)
+                        table_texts.append(
+                            f"[Table {t_idx} on Page {page_number}]\n{table_str}"
+                        )
+                except Exception:
+                    pass
+
+                # NEW: Detect figure/equation placeholders
+                # pdfplumber can't OCR images, but we can detect captions
+                figure_mentions: list[str] = []
+                fig_matches = re.finditer(
+                    r"(Figure|Fig\.)\s*\d+[.:]?\s*[^\n]{10,200}",
+                    text,
+                    re.IGNORECASE,
+                )
+                for m in fig_matches:
+                    figure_mentions.append(f"[Figure Mention: {m.group(0).strip()}]")
+
+                eq_matches = re.finditer(
+                    r"\(?\s*Eq\.?\s*\d+[a-z]?\s*\)?",
+                    text,
+                    re.IGNORECASE,
+                )
+                equation_mentions: list[str] = []
+                for m in eq_matches:
+                    equation_mentions.append(f"[Equation Mention: {m.group(0).strip()}]")
+
+                # Assemble full page content
+                parts: list[str] = []
                 if text:
-                    page_texts.append(
-                        f"[Page {page_number}]\n{text}"
-                    )
+                    parts.append(text)
+                if table_texts:
+                    parts.append("\n\n".join(table_texts))
+                if figure_mentions:
+                    parts.append("\n".join(figure_mentions))
+                if equation_mentions:
+                    parts.append("\n".join(equation_mentions))
+
+                full_page = "\n\n".join(parts)
+
+                if full_page.strip():
+                    page_texts.append(f"[Page {page_number}]\n{full_page}")
 
             if not page_texts:
                 raise PDFProcessingError(
@@ -108,7 +211,7 @@ def extract_text_from_pdf(pdf_source: BinaryIO | str) -> str:
                     "It may be a scanned image-only document."
                 )
 
-            full_text = "\n\n".join(page_texts)
+            full_text = meta_header + "\n\n".join(page_texts)
 
             # Basic extraction sanity check.
             alpha_chars = sum(char.isalpha() for char in full_text)
@@ -235,19 +338,19 @@ def _chunk_section_text(
     if len(text) <= effective_size:
         return [f"{prefix}{text}"]
 
-    # Better sentence splitting for academic text.
-    sentence_pattern = re.compile(
-        r"(?<=[.!?])\s+(?=[A-Z0-9\[])"
-    )
+    # NEW: Protect abbreviations before sentence splitting
+    protected_text = _protect_abbreviations(text)
 
-    sentences = sentence_pattern.split(text)
+    # Better sentence splitting for academic text.
+    sentence_pattern = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\[])")
+    sentences = sentence_pattern.split(protected_text)
 
     # If extraction doesn't give useful sentences, fall back to words.
     if len(sentences) <= 1:
         return [
-            f"{prefix}{piece}"
+            f"{prefix}{_restore_abbreviations(piece)}"
             for piece in _split_long_sentence(
-                text,
+                _restore_abbreviations(text),
                 effective_size,
                 overlap,
             )
@@ -261,6 +364,9 @@ def _chunk_section_text(
 
         if not sentence:
             continue
+
+        # Restore abbreviations in this sentence before chunking
+        sentence = _restore_abbreviations(sentence)
 
         if len(sentence) > effective_size:
             if current:

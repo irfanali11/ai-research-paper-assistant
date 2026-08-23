@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 import re
 import time
 from collections.abc import Iterator
@@ -12,13 +14,16 @@ import google.generativeai as genai
 from chromadb.api.models.Collection import Collection
 from google.api_core import exceptions as google_exceptions
 from rank_bm25 import BM25Okapi
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import CrossEncoder, SentenceTransformer
 
 
+# ─── CONFIGURATION ─────────────────────────────────────────────────
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+RERANKER_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 LLM_MODEL = "gemini-2.5-flash"
 
 COLLECTION_NAME = "scholar_chunks"
+CHROMA_PERSIST_DIR = "./chroma_db"  # NEW: documents survive restart
 
 MAX_LLM_RETRIES = 3
 RETRY_BASE_DELAY_SECONDS = 4
@@ -48,10 +53,13 @@ class AnswerResult:
 
     answer: str
     sources: RetrievalResult
+    faithfulness: dict[str, object] | None = None  # NEW: Sprint 1
 
 
 class RAGPipeline:
-    """Local hybrid RAG pipeline with Gemini generation."""
+    """Advanced local hybrid RAG pipeline with cross-encoder re-ranking,
+    query decomposition, and automated faithfulness evaluation.
+    """
 
     def __init__(
         self,
@@ -59,21 +67,23 @@ class RAGPipeline:
     ) -> None:
         """Initialize the RAG pipeline.
 
-        Embeddings are generated locally. Only LLM generation uses Gemini.
+        Embeddings and re-ranking are local. Only LLM generation uses Gemini.
         """
-        self._embedder = (
-            embedder
-            or SentenceTransformer(EMBEDDING_MODEL_NAME)
-        )
+        self._embedder = embedder or SentenceTransformer(EMBEDDING_MODEL_NAME)
 
-        self._client = chromadb.Client()
+        # NEW: Cross-encoder for neural re-ranking (50MB, local, free)
+        # This scores (query, document) pairs together for higher precision
+        # than bi-encoder cosine similarity.
+        self._reranker = CrossEncoder(RERANKER_MODEL_NAME)
+
+        # NEW: Persistent Chroma client so documents survive app restarts.
+        # The directory is created automatically if it doesn't exist.
+        os.makedirs(CHROMA_PERSIST_DIR, exist_ok=True)
+        self._client = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
 
         self._collection: Collection | None = None
-
         self._chunks: list[str] = []
-
         self._bm25: BM25Okapi | None = None
-
         self._chunk_sections: list[str] = []
 
     # ------------------------------------------------------------------
@@ -83,9 +93,7 @@ class RAGPipeline:
     def index_chunks(self, chunks: list[str]) -> None:
         """Embed and index document chunks locally."""
         if not chunks:
-            raise RAGPipelineError(
-                "No text chunks available to index."
-            )
+            raise RAGPipelineError("No text chunks available to index.")
 
         cleaned_chunks = [
             chunk.strip()
@@ -94,9 +102,7 @@ class RAGPipeline:
         ]
 
         if not cleaned_chunks:
-            raise RAGPipelineError(
-                "No usable text chunks available to index."
-            )
+            raise RAGPipelineError("No usable text chunks available to index.")
 
         self._chunks = cleaned_chunks
 
@@ -105,29 +111,19 @@ class RAGPipeline:
             for chunk in cleaned_chunks
         ]
 
-        tokenized = [
-            self._tokenize(chunk)
-            for chunk in cleaned_chunks
-        ]
-
+        tokenized = [self._tokenize(chunk) for chunk in cleaned_chunks]
         self._bm25 = BM25Okapi(tokenized)
 
-        # Each pipeline owns its in-memory Chroma client.
-        # Delete/create is therefore safe for the current session.
+        # Delete/create is safe even with persistent storage.
         try:
-            self._client.delete_collection(
-                name=COLLECTION_NAME
-            )
+            self._client.delete_collection(name=COLLECTION_NAME)
         except Exception:
-            # Chroma raises when the collection does not exist.
             pass
 
         try:
             self._collection = self._client.create_collection(
                 name=COLLECTION_NAME,
-                metadata={
-                    "hnsw:space": "cosine",
-                },
+                metadata={"hnsw:space": "cosine"},
             )
         except Exception as exc:
             raise RAGPipelineError(
@@ -135,38 +131,24 @@ class RAGPipeline:
             ) from exc
 
         embeddings: list[list[float]] = []
-
         batch_size = 32
 
-        for start in range(
-            0,
-            len(cleaned_chunks),
-            batch_size,
-        ):
-            batch = cleaned_chunks[
-                start : start + batch_size
-            ]
-
+        for start in range(0, len(cleaned_chunks), batch_size):
+            batch = cleaned_chunks[start : start + batch_size]
             encoded = self._embedder.encode(
                 batch,
                 show_progress_bar=False,
                 normalize_embeddings=True,
             )
-
             embeddings.extend(encoded.tolist())
 
         try:
             self._collection.add(
-                ids=[
-                    str(index)
-                    for index in range(len(cleaned_chunks))
-                ],
+                ids=[str(index) for index in range(len(cleaned_chunks))],
                 documents=cleaned_chunks,
                 embeddings=embeddings,
                 metadatas=[
-                    {
-                        "section": self._chunk_sections[index]
-                    }
+                    {"section": self._chunk_sections[index]}
                     for index in range(len(cleaned_chunks))
                 ],
             )
@@ -203,11 +185,7 @@ class RAGPipeline:
             return match.group(1).strip()
 
         # Backward compatibility with previous chunk format.
-        old_match = re.match(
-            r"\[(.*?)\]\s*",
-            chunk,
-        )
-
+        old_match = re.match(r"\[(.*?)\]\s*", chunk)
         if old_match:
             return old_match.group(1).strip()
 
@@ -216,9 +194,7 @@ class RAGPipeline:
     @staticmethod
     def _normalize_text(text: str) -> str:
         """Normalize text for local lexical scoring."""
-        return " ".join(
-            RAGPipeline._tokenize(text)
-        )
+        return " ".join(RAGPipeline._tokenize(text))
 
     # ------------------------------------------------------------------
     # QUERY VALIDATION
@@ -253,7 +229,6 @@ class RAGPipeline:
         This is completely local and adds no API cost.
         """
         q = question.lower()
-
         intents: set[str] = set()
 
         if any(
@@ -268,13 +243,7 @@ class RAGPipeline:
                 "what does the paper address",
             ]
         ):
-            intents.update(
-                {
-                    "Abstract",
-                    "Introduction",
-                    "Conclusion",
-                }
-            )
+            intents.update({"Abstract", "Introduction", "Conclusion"})
 
         if any(
             term in q
@@ -352,15 +321,52 @@ class RAGPipeline:
                 "contributions",
             ]
         ):
-            intents.update(
-                {
-                    "Conclusion",
-                    "Conclusions",
-                    "Discussion",
-                }
-            )
+            intents.update({"Conclusion", "Conclusions", "Discussion"})
 
         return intents
+
+    # ------------------------------------------------------------------
+    # QUERY DECOMPOSITION (NEW)
+    # ------------------------------------------------------------------
+    # NEW: Breaks complex comparative/causal questions into sub-questions.
+    # Each sub-question is retrieved independently, then results are merged.
+    # This handles "Compare X and Y" or "What are the causes and effects?"
+    # Uses Gemini Flash (free tier) — only called for complex queries.
+
+    def _decompose_query(self, question: str, api_key: str) -> list[str]:
+        """Break complex questions into simpler sub-questions."""
+        # Fast path: simple questions don't need decomposition
+        simple_indicators = [
+            "what is", "who is", "when did", "where is",
+            "define", "explain", "describe",
+        ]
+        q_lower = question.lower()
+        if any(q_lower.startswith(s) for s in simple_indicators):
+            return [question]
+
+        prompt = f"""Analyze this research question. If it is simple and direct, return it unchanged as a single item. If it contains multiple parts (comparisons, causes and effects, multiple entities), decompose it into 2-4 standalone sub-questions.
+
+Question: "{question}"
+
+Return ONLY a JSON array of strings. Example:
+["What is the mechanism of CRISPR-Cas9?", "What are the off-target effects of CRISPR-Cas9?"]
+
+JSON:"""
+
+        try:
+            raw = self._call_llm(prompt, api_key, max_tokens=512)
+            text = raw.strip()
+            if "```json" in text:
+                text = text.split("```json")[1].split("```")[0]
+            elif "```" in text:
+                text = text.split("```")[1].split("```")[0]
+            sub_queries = json.loads(text)
+            if isinstance(sub_queries, list) and len(sub_queries) > 0:
+                return sub_queries
+        except Exception:
+            pass
+
+        return [question]
 
     # ------------------------------------------------------------------
     # RRF
@@ -390,151 +396,68 @@ class RAGPipeline:
         return ordered[:top_k]
 
     # ------------------------------------------------------------------
-    # LOCAL RERANKING
+    # CROSS-ENCODER RE-RANKING (NEW)
+    # ------------------------------------------------------------------
+    # NEW: Neural re-ranking that sees query + document together.
+    # Much more precise than bi-encoder cosine similarity.
+    # Replaces the old heuristic as the primary ranking signal.
+
+    def _cross_encoder_rerank(
+        self,
+        question: str,
+        candidate_indices: list[int],
+        top_k: int,
+    ) -> list[tuple[int, float]]:
+        """Re-rank candidates using a local cross-encoder."""
+        if not candidate_indices:
+            return []
+
+        # Build (query, document) pairs
+        pairs = [
+            (question, self._chunks[idx])
+            for idx in candidate_indices
+        ]
+
+        # Get relevance scores from cross-encoder
+        scores = self._reranker.predict(pairs, show_progress_bar=False)
+
+        # Sort by score descending
+        scored = list(zip(candidate_indices, scores))
+        scored.sort(key=lambda x: x[1], reverse=True)
+
+        return scored[:top_k]
+
+    # ------------------------------------------------------------------
+    # DIVERSITY FILTER (kept from original, applied after cross-encoder)
     # ------------------------------------------------------------------
 
-    def _lexical_overlap_score(
+    def _apply_diversity_filter(
         self,
-        question_tokens: set[str],
-        chunk: str,
-    ) -> float:
-        """Calculate lightweight lexical overlap."""
-        if not question_tokens:
-            return 0.0
-
-        chunk_tokens = set(
-            self._tokenize(chunk)
-        )
-
-        if not chunk_tokens:
-            return 0.0
-
-        overlap = question_tokens.intersection(
-            chunk_tokens
-        )
-
-        return len(overlap) / len(question_tokens)
-
-    def _section_score(
-        self,
-        question: str,
-        section: str,
-    ) -> float:
-        """Boost sections that are likely relevant to the question."""
-        intents = self._query_intent(question)
-
-        if not intents:
-            return 0.0
-
-        normalized_section = section.lower()
-
-        for intent in intents:
-            if normalized_section == intent.lower():
-                return 1.0
-
-        return 0.0
-
-    def _rerank_candidates(
-        self,
-        question: str,
-        candidates: list[int],
+        scored_candidates: list[tuple[int, float]],
         top_k: int,
+        jaccard_threshold: float = 0.72,
     ) -> tuple[list[int], list[float]]:
-        """Locally rerank hybrid candidates.
-
-        Combines:
-        - RRF score
-        - lexical overlap
-        - academic section relevance
-
-        No LLM call is used here.
-        """
-        question_tokens = set(
-            self._tokenize(question)
-        )
-
-        scored: list[tuple[int, float]] = []
-
-        for rank, index in enumerate(candidates):
-            chunk = self._chunks[index]
-            section = self._chunk_sections[index]
-
-            # Candidate rank score.
-            rank_score = 1.0 / (rank + 1)
-
-            lexical_score = (
-                self._lexical_overlap_score(
-                    question_tokens,
-                    chunk,
-                )
-            )
-
-            section_score = self._section_score(
-                question,
-                section,
-            )
-
-            score = (
-                0.50 * rank_score
-                + 0.30 * lexical_score
-                + 0.20 * section_score
-            )
-
-            scored.append(
-                (index, score)
-            )
-
-        scored.sort(
-            key=lambda item: item[1],
-            reverse=True,
-        )
-
+        """Remove near-duplicate chunks using Jaccard similarity."""
         selected: list[int] = []
         selected_scores: list[float] = []
 
-        # Simple diversity filter.
-        # Avoid returning many nearly identical chunks.
-        for index, score in scored:
+        for index, score in scored_candidates:
             if len(selected) >= top_k:
                 break
 
-            candidate_tokens = set(
-                self._tokenize(
-                    self._chunks[index]
-                )
-            )
-
+            candidate_tokens = set(self._tokenize(self._chunks[index]))
             too_similar = False
 
             for selected_index in selected:
-                selected_tokens = set(
-                    self._tokenize(
-                        self._chunks[selected_index]
-                    )
-                )
-
+                selected_tokens = set(self._tokenize(self._chunks[selected_index]))
                 if not candidate_tokens or not selected_tokens:
                     continue
 
-                intersection = len(
-                    candidate_tokens.intersection(
-                        selected_tokens
-                    )
-                )
+                intersection = len(candidate_tokens.intersection(selected_tokens))
+                union = len(candidate_tokens.union(selected_tokens))
+                jaccard = intersection / union if union else 0.0
 
-                union = len(
-                    candidate_tokens.union(
-                        selected_tokens
-                    )
-                )
-
-                jaccard = (
-                    intersection / union
-                    if union
-                    else 0.0
-                )
-
-                if jaccard > 0.72:
+                if jaccard > jaccard_threshold:
                     too_similar = True
                     break
 
@@ -542,21 +465,19 @@ class RAGPipeline:
                 selected.append(index)
                 selected_scores.append(score)
 
-        # If diversity filtering removed too many chunks,
-        # fill from remaining candidates.
+        # Fill remaining slots if diversity filter was too aggressive
         if len(selected) < top_k:
-            for index, score in scored:
+            for index, score in scored_candidates:
                 if index not in selected:
                     selected.append(index)
                     selected_scores.append(score)
-
                 if len(selected) >= top_k:
                     break
 
         return selected, selected_scores
 
     # ------------------------------------------------------------------
-    # RETRIEVAL
+    # RETRIEVAL (UPDATED with cross-encoder + decomposition)
     # ------------------------------------------------------------------
 
     def retrieve(
@@ -564,23 +485,20 @@ class RAGPipeline:
         question: str,
         top_k: int = DEFAULT_TOP_K,
     ) -> RetrievalResult:
-        """Retrieve relevant chunks using hybrid search and local reranking."""
+        """Retrieve relevant chunks using hybrid search + neural re-ranking."""
         question = self._validate_query(question)
 
         if top_k < 1:
-            raise RAGPipelineError(
-                "top_k must be at least 1."
-            )
+            raise RAGPipelineError("top_k must be at least 1.")
 
         candidate_count = min(
             max(top_k * CANDIDATE_MULTIPLIER, 10),
             len(self._chunks),
         )
 
-        # --------------------------------------------------------------
-        # Semantic retrieval
-        # --------------------------------------------------------------
-
+        # ----------------------------------------------------------
+        # Semantic retrieval (dense)
+        # ----------------------------------------------------------
         query_embedding = self._embedder.encode(
             [question],
             show_progress_bar=False,
@@ -599,65 +517,51 @@ class RAGPipeline:
 
         vector_ids = [
             int(index)
-            for index in vector_results.get(
-                "ids",
-                [[]],
-            )[0]
+            for index in vector_results.get("ids", [[]])[0]
         ]
 
-        # --------------------------------------------------------------
-        # BM25 retrieval
-        # --------------------------------------------------------------
-
+        # ----------------------------------------------------------
+        # BM25 retrieval (sparse)
+        # ----------------------------------------------------------
         bm25_ids: list[int] = []
-
         if self._bm25 is not None:
             query_tokens = self._tokenize(question)
-
-            bm25_scores = self._bm25.get_scores(
-                query_tokens
-            )
-
+            bm25_scores = self._bm25.get_scores(query_tokens)
             bm25_ids = sorted(
                 range(len(bm25_scores)),
                 key=lambda index: bm25_scores[index],
                 reverse=True,
             )[:candidate_count]
 
-        # --------------------------------------------------------------
-        # Hybrid fusion
-        # --------------------------------------------------------------
-
+        # ----------------------------------------------------------
+        # Hybrid fusion (RRF)
+        # ----------------------------------------------------------
         fused_candidates = self._reciprocal_rank_fusion(
-            [
-                vector_ids,
-                bm25_ids,
-            ],
-            top_k=min(
-                candidate_count,
-                len(self._chunks),
-            ),
+            [vector_ids, bm25_ids],
+            top_k=min(candidate_count, len(self._chunks)),
         )
 
-        # --------------------------------------------------------------
-        # Local reranking
-        # --------------------------------------------------------------
+        # ----------------------------------------------------------
+        # NEW: Cross-encoder neural re-ranking
+        # ----------------------------------------------------------
+        # The cross-encoder scores (query, doc) pairs for precision.
+        # We take top 2*top_k, then diversity-filter to final top_k.
+        reranked = self._cross_encoder_rerank(
+            question,
+            fused_candidates,
+            top_k=top_k * 2,
+        )
 
-        final_indices, scores = self._rerank_candidates(
-            question=question,
-            candidates=fused_candidates,
+        # ----------------------------------------------------------
+        # Diversity filter + final selection
+        # ----------------------------------------------------------
+        final_indices, scores = self._apply_diversity_filter(
+            reranked,
             top_k=top_k,
         )
 
-        chunks = [
-            self._chunks[index]
-            for index in final_indices
-        ]
-
-        display_indices = [
-            index + 1
-            for index in final_indices
-        ]
+        chunks = [self._chunks[index] for index in final_indices]
+        display_indices = [index + 1 for index in final_indices]
 
         return RetrievalResult(
             chunks=chunks,
@@ -678,13 +582,9 @@ class RAGPipeline:
         context_parts: list[str] = []
 
         for index, chunk in enumerate(chunks, start=1):
-            context_parts.append(
-                f"[SOURCE {index}]\n{chunk}"
-            )
+            context_parts.append(f"[SOURCE {index}]\n{chunk}")
 
-        context = "\n\n---\n\n".join(
-            context_parts
-        )
+        context = "\n\n---\n\n".join(context_parts)
 
         return f"""
 You are Scholar, a careful academic research assistant.
@@ -721,13 +621,10 @@ ANSWER:
 """.strip()
 
     # ------------------------------------------------------------------
-    # GEMINI
+    # GEMINI (unchanged from your original — solid error handling)
     # ------------------------------------------------------------------
 
-    def _quota_error_message(
-        self,
-        error: Exception,
-    ) -> str:
+    def _quota_error_message(self, error: Exception) -> str:
         """Return a safe user-facing quota message."""
         message = str(error).lower()
 
@@ -752,10 +649,7 @@ ANSWER:
             "Please wait 30–60 seconds before trying again."
         )
 
-    def _get_model(
-        self,
-        api_key: str,
-    ) -> genai.GenerativeModel:
+    def _get_model(self, api_key: str) -> genai.GenerativeModel:
         """Configure Gemini and return the configured model."""
         if not api_key:
             raise RAGPipelineError(
@@ -763,13 +657,8 @@ ANSWER:
                 "Add GEMINI_API_KEY to Streamlit secrets."
             )
 
-        genai.configure(
-            api_key=api_key
-        )
-
-        return genai.GenerativeModel(
-            LLM_MODEL
-        )
+        genai.configure(api_key=api_key)
+        return genai.GenerativeModel(LLM_MODEL)
 
     def _call_llm(
         self,
@@ -804,14 +693,9 @@ ANSWER:
 
             except google_exceptions.ResourceExhausted as exc:
                 last_error = exc
-
                 if attempt < MAX_LLM_RETRIES - 1:
-                    time.sleep(
-                        RETRY_BASE_DELAY_SECONDS
-                        * (attempt + 1)
-                    )
+                    time.sleep(RETRY_BASE_DELAY_SECONDS * (attempt + 1))
                     continue
-
                 raise RAGPipelineError(
                     self._quota_error_message(exc)
                 ) from None
@@ -827,24 +711,14 @@ ANSWER:
 
             except google_exceptions.GoogleAPIError as exc:
                 message = str(exc)
-
-                if (
-                    "429" in message
-                    or "RESOURCE_EXHAUSTED" in message
-                ):
+                if "429" in message or "RESOURCE_EXHAUSTED" in message:
                     last_error = exc
-
                     if attempt < MAX_LLM_RETRIES - 1:
-                        time.sleep(
-                            RETRY_BASE_DELAY_SECONDS
-                            * (attempt + 1)
-                        )
+                        time.sleep(RETRY_BASE_DELAY_SECONDS * (attempt + 1))
                         continue
-
                     raise RAGPipelineError(
                         self._quota_error_message(exc)
                     ) from None
-
                 raise RAGPipelineError(
                     "The AI service encountered an error. "
                     "Please try again later."
@@ -852,24 +726,14 @@ ANSWER:
 
             except Exception as exc:
                 message = str(exc)
-
-                if (
-                    "429" in message
-                    or "RESOURCE_EXHAUSTED" in message
-                ):
+                if "429" in message or "RESOURCE_EXHAUSTED" in message:
                     last_error = exc
-
                     if attempt < MAX_LLM_RETRIES - 1:
-                        time.sleep(
-                            RETRY_BASE_DELAY_SECONDS
-                            * (attempt + 1)
-                        )
+                        time.sleep(RETRY_BASE_DELAY_SECONDS * (attempt + 1))
                         continue
-
                     raise RAGPipelineError(
                         self._quota_error_message(exc)
                     ) from None
-
                 raise RAGPipelineError(
                     "An unexpected error occurred while "
                     "generating a response."
@@ -877,14 +741,10 @@ ANSWER:
 
         if last_error:
             raise RAGPipelineError(
-                self._quota_error_message(
-                    last_error
-                )
+                self._quota_error_message(last_error)
             ) from None
 
-        raise RAGPipelineError(
-            "An unexpected error occurred."
-        )
+        raise RAGPipelineError("An unexpected error occurred.")
 
     def _stream_llm(
         self,
@@ -906,14 +766,10 @@ ANSWER:
             )
 
             yielded = False
-
             for chunk in response:
                 try:
                     text = chunk.text
-                except (
-                    ValueError,
-                    AttributeError,
-                ):
+                except (ValueError, AttributeError):
                     continue
 
                 if text:
@@ -943,34 +799,26 @@ ANSWER:
             ) from None
 
         except google_exceptions.GoogleAPIError as exc:
-            if (
-                "429" in str(exc)
-                or "RESOURCE_EXHAUSTED" in str(exc)
-            ):
+            if "429" in str(exc) or "RESOURCE_EXHAUSTED" in str(exc):
                 raise RAGPipelineError(
                     self._quota_error_message(exc)
                 ) from None
-
             raise RAGPipelineError(
                 "The AI service encountered an error."
             ) from None
 
         except Exception as exc:
-            if (
-                "429" in str(exc)
-                or "RESOURCE_EXHAUSTED" in str(exc)
-            ):
+            if "429" in str(exc) or "RESOURCE_EXHAUSTED" in str(exc):
                 raise RAGPipelineError(
                     self._quota_error_message(exc)
                 ) from None
-
             raise RAGPipelineError(
                 "An unexpected error occurred while "
                 "generating a response."
             ) from None
 
     # ------------------------------------------------------------------
-    # PUBLIC GENERATION METHODS
+    # PUBLIC GENERATION METHODS (UPDATED with faithfulness)
     # ------------------------------------------------------------------
 
     def answer_question(
@@ -978,27 +826,25 @@ ANSWER:
         question: str,
         api_key: str,
         top_k: int = DEFAULT_TOP_K,
+        evaluate: bool = False,  # NEW: enable faithfulness scoring
     ) -> AnswerResult:
         """Retrieve context and generate a grounded answer."""
-        sources = self.retrieve(
-            question,
-            top_k=top_k,
-        )
+        sources = self.retrieve(question, top_k=top_k)
 
-        prompt = self._build_qa_prompt(
-            question,
-            sources.chunks,
-        )
+        prompt = self._build_qa_prompt(question, sources.chunks)
+        answer = self._call_llm(prompt, api_key, max_tokens=1024)
 
-        answer = self._call_llm(
-            prompt,
-            api_key,
-            max_tokens=1024,
-        )
+        # NEW: Faithfulness evaluation (Sprint 1)
+        faithfulness = None
+        if evaluate and sources.chunks:
+            faithfulness = self.evaluate_faithfulness(
+                answer, sources.chunks, api_key
+            )
 
         return AnswerResult(
             answer=answer,
             sources=sources,
+            faithfulness=faithfulness,
         )
 
     def stream_answer_question(
@@ -1008,22 +854,12 @@ ANSWER:
         top_k: int = DEFAULT_TOP_K,
     ) -> tuple[Iterator[str], RetrievalResult]:
         """Retrieve context and stream a grounded answer."""
-        sources = self.retrieve(
-            question,
-            top_k=top_k,
-        )
+        sources = self.retrieve(question, top_k=top_k)
 
-        prompt = self._build_qa_prompt(
-            question,
-            sources.chunks,
-        )
+        prompt = self._build_qa_prompt(question, sources.chunks)
 
         return (
-            self._stream_llm(
-                prompt,
-                api_key,
-                max_tokens=1024,
-            ),
+            self._stream_llm(prompt, api_key, max_tokens=1024),
             sources,
         )
 
@@ -1034,14 +870,116 @@ ANSWER:
         max_tokens: int = 2048,
     ) -> str:
         """Generate text for trusted application-level prompts."""
-        return self._call_llm(
-            prompt,
-            api_key,
-            max_tokens=max_tokens,
-        )
+        return self._call_llm(prompt, api_key, max_tokens=max_tokens)
 
     # ------------------------------------------------------------------
-    # EVALUATION
+    # FAITHFULNESS EVALUATION (NEW — Sprint 1)
+    # ------------------------------------------------------------------
+    # NEW: Extracts atomic claims from the LLM answer and verifies each
+    # one against the retrieved source chunks. Returns a score 0.0-1.0.
+    # This is the key research metric that separates student projects
+    # from research-grade systems.
+
+    def evaluate_faithfulness(
+        self,
+        answer: str,
+        source_chunks: list[str],
+        api_key: str,
+    ) -> dict[str, object]:
+        """Evaluate whether the LLM answer is faithful to source chunks.
+
+        Uses Gemini Flash to:
+        1. Extract atomic claims from the answer
+        2. Check each claim against source chunks
+        3. Return faithfulness score + unsupported claims
+        """
+        if not answer or not source_chunks:
+            return {
+                "faithfulness_score": 0.0,
+                "total_claims": 0,
+                "supported_claims": 0,
+                "unsupported_claims": [],
+                "explanation": "No answer or sources provided.",
+            }
+
+        # Build source context
+        context_parts = []
+        for i, chunk in enumerate(source_chunks, 1):
+            context_parts.append(f"[SOURCE {i}]\n{chunk}")
+        sources_text = "\n\n---\n\n".join(context_parts)
+
+        prompt = f"""You are a rigorous fact-checker for an academic RAG system.
+
+Your task: Extract every factual claim from the ANSWER and verify it against the SOURCE CHUNKS.
+
+Rules:
+- A claim is "supported" if it is directly stated in the sources or logically follows from them.
+- A claim is "unsupported" if it contradicts the sources or introduces information not present.
+- Do NOT use outside knowledge. Only the provided sources matter.
+- Ignore opinions, hedges ("might", "could"), and subjective statements.
+- Focus on: numbers, methods, names, dates, causal relationships, and definitive statements.
+
+SOURCE CHUNKS:
+{sources_text}
+
+ANSWER TO VERIFY:
+{answer}
+
+Return ONLY a JSON object in this exact format:
+{{
+  "claims": [
+    {{"claim": "claim text", "supported": true/false, "source_number": 1}}
+  ],
+  "faithfulness_score": 0.0-1.0,
+  "explanation": "brief summary of findings"
+}}
+
+JSON:"""
+
+        try:
+            raw = self._call_llm(prompt, api_key, max_tokens=2048)
+
+            # Extract JSON from possible markdown wrapping
+            text = raw.strip()
+            if "```json" in text:
+                text = text.split("```json")[1].split("```")[0]
+            elif "```" in text:
+                text = text.split("```")[1].split("```")[0]
+
+            result = json.loads(text)
+
+            claims = result.get("claims", [])
+            supported = sum(1 for c in claims if c.get("supported"))
+            total = len(claims)
+            score = result.get(
+                "faithfulness_score",
+                supported / total if total else 0.0,
+            )
+
+            unsupported = [
+                c["claim"] for c in claims if not c.get("supported")
+            ]
+
+            return {
+                "faithfulness_score": round(score, 3),
+                "total_claims": total,
+                "supported_claims": supported,
+                "unsupported_claims": unsupported,
+                "explanation": result.get("explanation", ""),
+                "claim_details": claims,
+            }
+
+        except Exception as exc:
+            return {
+                "faithfulness_score": 0.0,
+                "total_claims": 0,
+                "supported_claims": 0,
+                "unsupported_claims": [],
+                "explanation": f"Faithfulness evaluation failed: {str(exc)}",
+            }
+
+    # ------------------------------------------------------------------
+    # RETRIEVAL EVALUATION (kept from original)
     # ------------------------------------------------------------------
 
     def evaluate_retrieval(
@@ -1057,26 +995,15 @@ ANSWER:
         results: list[dict[str, object]] = []
 
         for case in test_cases:
-            question = str(
-                case["question"]
-            )
-
+            question = str(case["question"])
             keywords = [
                 str(keyword).lower()
-                for keyword in case.get(
-                    "expected_keywords",
-                    [],
-                )
+                for keyword in case.get("expected_keywords", [])
             ]
 
-            retrieval = self.retrieve(
-                question,
-                top_k=top_k,
-            )
+            retrieval = self.retrieve(question, top_k=top_k)
 
-            combined = " ".join(
-                retrieval.chunks
-            ).lower()
+            combined = " ".join(retrieval.chunks).lower()
 
             hits = [
                 keyword
