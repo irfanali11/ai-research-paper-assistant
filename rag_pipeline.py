@@ -18,7 +18,14 @@ from sentence_transformers import CrossEncoder, SentenceTransformer
 
 
 # ─── CONFIGURATION ─────────────────────────────────────────────────
-EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+# CHANGED: swapped from all-MiniLM-L6-v2 to BGE-base for stronger,
+# retrieval-tuned embeddings (384-dim -> 768-dim).
+EMBEDDING_MODEL_NAME = "BAAI/bge-base-en-v1.5"
+
+# NEW: BGE models expect this instruction prefix on QUERY text only
+# (not on stored document/chunk text) for retrieval tasks.
+BGE_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
+
 RERANKER_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 LLM_MODEL = "gemini-2.5-flash"
 
@@ -133,6 +140,9 @@ class RAGPipeline:
         embeddings: list[list[float]] = []
         batch_size = 32
 
+        # NOTE: Document/chunk text is embedded WITHOUT the BGE query
+        # prefix. BGE only expects the instruction prefix on the query
+        # side; passages are embedded as-is.
         for start in range(0, len(cleaned_chunks), batch_size):
             batch = cleaned_chunks[start : start + batch_size]
             encoded = self._embedder.encode(
@@ -499,8 +509,11 @@ JSON:"""
         # ----------------------------------------------------------
         # Semantic retrieval (dense)
         # ----------------------------------------------------------
+        # CHANGED: BGE models expect a query instruction prefix for
+        # retrieval tasks. This is applied ONLY to the query, never
+        # to stored document/chunk embeddings (see index_chunks()).
         query_embedding = self._embedder.encode(
-            [question],
+            [BGE_QUERY_PREFIX + question],
             show_progress_bar=False,
             normalize_embeddings=True,
         ).tolist()
