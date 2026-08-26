@@ -845,7 +845,11 @@ ANSWER:
         sources = self.retrieve(question, top_k=top_k)
 
         prompt = self._build_qa_prompt(question, sources.chunks)
-        answer = self._call_llm(prompt, api_key, max_tokens=1024)
+        # CHANGED: raised from 1024 -> 4096. Gemini 2.5's internal
+        # "thinking" tokens count against max_output_tokens, so 1024
+        # was leaving too little room for the visible answer and
+        # answers were getting cut off mid-sentence.
+        answer = self._call_llm(prompt, api_key, max_tokens=4096)
 
         # NEW: Faithfulness evaluation (Sprint 1)
         faithfulness = None
@@ -872,7 +876,9 @@ ANSWER:
         prompt = self._build_qa_prompt(question, sources.chunks)
 
         return (
-            self._stream_llm(prompt, api_key, max_tokens=1024),
+            # CHANGED: raised from 1024 -> 4096, same reasoning as
+            # answer_question() above.
+            self._stream_llm(prompt, api_key, max_tokens=4096),
             sources,
         )
 
@@ -950,7 +956,10 @@ Return ONLY a JSON object in this exact format:
 JSON:"""
 
         try:
-            raw = self._call_llm(prompt, api_key, max_tokens=2048)
+            # CHANGED: raised from 2048 -> 4096 so claim extraction +
+            # verification JSON doesn't get truncated mid-object on
+            # longer answers with many claims.
+            raw = self._call_llm(prompt, api_key, max_tokens=4096)
 
             # Extract JSON from possible markdown wrapping
             text = raw.strip()

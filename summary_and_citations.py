@@ -402,7 +402,11 @@ def generate_structured_summary(
         return pipeline.generate_with_prompt(
             prompt,
             api_key,
-            max_tokens=1800,
+            # CHANGED: raised from 1800 -> 6000. Gemini 2.5's hidden
+            # "thinking" tokens count against this budget, so 1800 was
+            # frequently leaving too little room to finish all four
+            # summary sections, causing mid-sentence cutoffs.
+            max_tokens=6000,
         )
 
     except RAGPipelineError as exc:
@@ -504,6 +508,27 @@ def _clean_reference_text(raw_refs: str) -> str:
     return text.strip()
 
 
+# NEW: Rough entry-count estimators used to detect when the LLM has
+# silently dropped references — a real failure mode observed where a
+# 30-reference bibliography came back with only 16 entries and no
+# error, because the model just... stopped listing some of them.
+
+def _estimate_reference_count(raw_refs: str) -> int:
+    """Estimate how many individual references are in the raw text.
+
+    Academic reference lists almost always end each entry with a
+    4-digit year followed by a period (e.g. "...1998."), so counting
+    those is a reasonable proxy for entry count regardless of the
+    source PDF's exact formatting.
+    """
+    return len(re.findall(r"(?:19|20)\d{2}\.", raw_refs))
+
+
+def _count_formatted_entries(formatted: str) -> int:
+    """Count numbered list items in the LLM's formatted output."""
+    return len(re.findall(r"(?m)^\s*\d+\.\s", formatted))
+
+
 def format_citations(
     full_text: str,
     pipeline: RAGPipeline,
@@ -522,8 +547,15 @@ def format_citations(
 
     raw_refs = _clean_reference_text(raw_refs)
 
+    # NOTE: this truncation is on the INPUT (raw reference text sent
+    # to the model), separate from the output token cutoff issue.
+    # Left as-is since 12000 chars of references is already generous;
+    # the fix below is about the model having enough OUTPUT budget to
+    # actually format all of what it's given.
     if len(raw_refs) > 12000:
         raw_refs = raw_refs[:12000]
+
+    expected_count = _estimate_reference_count(raw_refs)
 
     prompt = f"""
 You are formatting references extracted from an academic paper.
@@ -539,6 +571,10 @@ Rules:
 - Repair obvious line-break and whitespace artifacts.
 - Each reference should be on its own numbered item.
 - If a reference is incomplete in the source, leave it incomplete.
+- The source contains approximately {expected_count if expected_count else "an unknown number of"} references.
+  You MUST include every single one. Do not stop early. Do not summarize
+  or skip any entry, even if it looks similar to another one.
+- Preserve the original ordering of the source references.
 
 SOURCE REFERENCES:
 
@@ -547,12 +583,41 @@ SOURCE REFERENCES:
 FORMATTED REFERENCES:
 """.strip()
 
-    try:
+    def _generate() -> str:
         return pipeline.generate_with_prompt(
             prompt,
             api_key,
-            max_tokens=3000,
+            # Raised from 3000 -> 6000. A full reference list needs
+            # real room to be fully re-numbered and formatted without
+            # cutting off partway through.
+            max_tokens=6000,
         )
+
+    try:
+        formatted = _generate()
+
+        # NEW: Completeness check. If the model dropped a large chunk
+        # of references, retry once with an even more explicit prompt
+        # before giving up and warning the user, rather than silently
+        # returning a partial list as if it were complete.
+        if expected_count > 0:
+            actual_count = _count_formatted_entries(formatted)
+
+            if actual_count < expected_count * 0.85:
+                formatted = _generate()
+                actual_count = _count_formatted_entries(formatted)
+
+            if actual_count < expected_count * 0.85:
+                formatted = (
+                    f"⚠️ **Note:** This paper appears to have around "
+                    f"{expected_count} references, but only {actual_count} "
+                    f"were formatted below. Some entries may be missing — "
+                    f"try re-extracting, or check the PDF's References "
+                    f"section directly for the full list.\n\n"
+                    + formatted
+                )
+
+        return formatted
 
     except RAGPipelineError as exc:
         raise SummaryError(str(exc)) from exc
