@@ -10,15 +10,23 @@ Scholar is a session-scoped academic PDF assistant using:
     Keyword retrieval   -> local BM25
     Faithfulness eval   -> Gemini (opt-in)
     Answer generation   -> Google Gemini only when requested
+    Related papers      -> Semantic Scholar (free, keyless)
 
-No document contents are intentionally sent to any external service other
-than the Gemini API during an explicit generation request.
+Scholar supports multiple loaded documents at once: chat can be scoped
+to one, several, or all loaded papers; Summary/Citations/Related Papers
+operate on one "focused" document at a time, chosen from the sidebar
+document library.
+
+No document contents are intentionally sent to any external service
+other than the Gemini API (on explicit generation request) and the
+Semantic Scholar search API (on explicit "Find Related Papers" click,
+which sends only the loaded paper's title/abstract, not its full text).
 """
 
 from __future__ import annotations
 
 import html
-import re  # NEW: for detecting table chunks
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -35,6 +43,11 @@ from rag_pipeline import (
     RAGPipeline,
     RAGPipelineError,
 )
+from semantic_scholar import (
+    RelatedPaper,
+    SemanticScholarError,
+    find_related_papers,
+)
 from summary_and_citations import (
     SummaryError,
     format_citations,
@@ -48,6 +61,7 @@ from summary_and_citations import (
 
 MAX_PDF_SIZE_MB = 25
 MAX_PDF_SIZE_BYTES = MAX_PDF_SIZE_MB * 1024 * 1024
+MAX_DOCUMENTS = 8
 
 EXAMPLE_QUESTIONS = [
     "What is the main research question?",
@@ -64,21 +78,18 @@ PROCESSING_STEPS = [
 ]
 
 
-# ---------------------------------------------------------------------------
-# Lightweight source compatibility object
-# ---------------------------------------------------------------------------
-
 @dataclass
 class _SourceRefs:
     """Lightweight source container used by the UI."""
 
     chunks: list[str]
     indices: list[int]
-    scores: list[float] | None = None  # NEW: cross-encoder scores
+    scores: list[float] | None = None
+    doc_names: list[str] | None = None
 
 
 # ---------------------------------------------------------------------------
-# Styling
+# Styling — restored original hero-banner look, extended for new features
 # ---------------------------------------------------------------------------
 
 def _inject_styles(dark_mode: bool) -> None:
@@ -242,6 +253,24 @@ def _inject_styles(dark_mode: bool) -> None:
                 border: 1px solid {border};
             }}
 
+            .doc-chip {{
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 0.5rem;
+                padding: 0.5rem 0.65rem;
+                border-radius: 8px;
+                border: 1px solid {border};
+                margin-bottom: 0.4rem;
+                font-size: 0.83rem;
+                background: {surface};
+            }}
+
+            .doc-chip-focused {{
+                border-color: {accent};
+                border-width: 2px;
+            }}
+
             .empty-state {{
                 background: {empty_bg};
                 border: 1px dashed {border};
@@ -286,7 +315,6 @@ def _inject_styles(dark_mode: bool) -> None:
                 margin: 0.25rem 0.35rem 0.25rem 0;
             }}
 
-            /* NEW: Faithfulness score badge styling */
             .faith-badge {{
                 display: inline-flex;
                 align-items: center;
@@ -341,6 +369,35 @@ def _inject_styles(dark_mode: bool) -> None:
 
             [data-testid="stFileUploader"] {{
                 margin-bottom: 0.75rem;
+            }}
+
+            /* Style raw markdown headings inside generated content
+               (summary ## headings etc.) so they match the design
+               system instead of oversized default browser headings. */
+            div[data-testid="stMarkdownContainer"] h1 {{
+                font-family: Georgia, "Times New Roman", serif;
+                font-size: 1.3rem;
+                font-weight: 600;
+                color: {accent};
+                margin: 1.1rem 0 0.5rem 0;
+                border-bottom: 1px solid {border};
+                padding-bottom: 0.4rem;
+            }}
+
+            div[data-testid="stMarkdownContainer"] h2 {{
+                font-family: Georgia, "Times New Roman", serif;
+                font-size: 1.15rem;
+                font-weight: 600;
+                color: {accent};
+                margin: 1.1rem 0 0.4rem 0;
+            }}
+
+            div[data-testid="stMarkdownContainer"] h3 {{
+                font-family: Georgia, "Times New Roman", serif;
+                font-size: 1.02rem;
+                font-weight: 600;
+                color: {text};
+                margin: 0.9rem 0 0.35rem 0;
             }}
 
             /* Chat */
@@ -407,6 +464,33 @@ def _inject_styles(dark_mode: bool) -> None:
                 font-style: italic;
             }}
 
+            .related-card {{
+                border: 1px solid {border};
+                border-radius: 10px;
+                padding: 0.9rem 1rem;
+                margin-bottom: 0.6rem;
+                background: {surface};
+            }}
+
+            .related-card-title {{
+                font-weight: 600;
+                font-size: 0.95rem;
+                margin-bottom: 0.2rem;
+                color: {text};
+            }}
+
+            .related-card-meta {{
+                color: {muted};
+                font-size: 0.8rem;
+                margin-bottom: 0.4rem;
+            }}
+
+            .related-card-abstract {{
+                color: {muted};
+                font-size: 0.85rem;
+                line-height: 1.5;
+            }}
+
             .scholar-footer {{
                 text-align: center;
                 color: {muted};
@@ -451,7 +535,7 @@ def _inject_styles(dark_mode: bool) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Cached local model
+# Cached local model / shared pipeline
 # ---------------------------------------------------------------------------
 
 @st.cache_resource(show_spinner=False)
@@ -461,15 +545,30 @@ def _load_embedder() -> SentenceTransformer:
     return SentenceTransformer(EMBEDDING_MODEL_NAME)
 
 
+@st.cache_resource(show_spinner=False)
+def _load_pipeline(_embedder: SentenceTransformer) -> RAGPipeline:
+    """Create a single shared RAGPipeline for the app process.
+
+    One pipeline instance holds every loaded document, so it is created
+    once and reused rather than rebuilt per upload.
+    """
+
+    return RAGPipeline(embedder=_embedder)
+
+
+def _get_pipeline() -> RAGPipeline:
+    """Return the shared pipeline, creating it on first use."""
+
+    embedder = _load_embedder()
+    return _load_pipeline(embedder)
+
+
 # ---------------------------------------------------------------------------
 # API key
 # ---------------------------------------------------------------------------
 
 def _get_api_key() -> str:
-    """Read Gemini API key from Streamlit secrets.
-
-    The key is never displayed in the UI.
-    """
+    """Read Gemini API key from Streamlit secrets."""
 
     try:
         value = st.secrets.get("GEMINI_API_KEY", "")
@@ -486,21 +585,17 @@ def _init_session_state() -> None:
     """Initialize all session-scoped application state."""
 
     defaults: dict[str, Any] = {
-        "pipeline": None,
-        "full_text": "",
-        "chunks": [],
+        "documents": {},
+        "focused_doc_id": None,
+        "active_doc_ids": [],
         "chat_history": [],
-        "summary": "",
-        "citations": "",
-        "pdf_processed": False,
-        "failed_file_key": "",
-        "last_upload_key": "",
-        "last_filename": "",
+        "failed_upload_key": "",
         "dark_mode": False,
         "processing": False,
-        # NEW: Evaluation toggles (opt-in to save API quota)
         "evaluate_faithfulness": False,
         "show_retrieval_details": False,
+        "related_papers_cache": {},
+        "uploader_version": 0,
     }
 
     for key, value in defaults.items():
@@ -508,18 +603,26 @@ def _init_session_state() -> None:
             st.session_state[key] = value
 
 
-def _reset_document_state() -> None:
-    """Clear all state associated with the currently loaded document."""
+def _remove_document(document_id: str) -> None:
+    """Remove one document from the library and the vector index."""
 
-    st.session_state.pipeline = None
-    st.session_state.full_text = ""
-    st.session_state.chunks = []
+    pipeline = _get_pipeline()
+    try:
+        pipeline.remove_document(document_id)
+    except RAGPipelineError:
+        pass
+
+    st.session_state.documents.pop(document_id, None)
+    st.session_state.active_doc_ids = [
+        d for d in st.session_state.active_doc_ids if d != document_id
+    ]
+    st.session_state.related_papers_cache.pop(document_id, None)
+
+    if st.session_state.focused_doc_id == document_id:
+        remaining = list(st.session_state.documents.keys())
+        st.session_state.focused_doc_id = remaining[0] if remaining else None
+
     st.session_state.chat_history = []
-    st.session_state.summary = ""
-    st.session_state.citations = ""
-    st.session_state.pdf_processed = False
-    st.session_state.failed_file_key = ""
-    st.session_state.last_filename = ""
 
 
 # ---------------------------------------------------------------------------
@@ -538,12 +641,9 @@ def _format_source_label(indices: list[int]) -> str:
     return f"Based on {noun} {joined}"
 
 
-# NEW: Detect if a chunk contains a table and format it nicely
 def _format_chunk_for_display(chunk: str) -> str:
     """Format a chunk for safe display, handling tables specially."""
-    # Check if this chunk contains a table marker
     if "[Table" in chunk and "|" in chunk:
-        # Extract the table portion
         lines = chunk.split("\n")
         table_lines = []
         other_lines = []
@@ -561,7 +661,6 @@ def _format_chunk_for_display(chunk: str) -> str:
             else:
                 other_lines.append(line)
 
-        # Format table as markdown code block for readability
         formatted = "\n".join(other_lines)
         if table_lines:
             table_text = "\n".join(table_lines)
@@ -571,7 +670,6 @@ def _format_chunk_for_display(chunk: str) -> str:
     return chunk
 
 
-# NEW: Extract section name from a chunk for display
 def _extract_display_section(chunk: str) -> str:
     """Extract the section name from a chunk prefix."""
     match = re.match(r"\[Section:\s*(.*?)\]\s*", chunk, re.IGNORECASE)
@@ -580,10 +678,36 @@ def _extract_display_section(chunk: str) -> str:
     return "Document"
 
 
+def _extract_title_and_abstract(full_text: str) -> tuple[str, str]:
+    """Best-effort extraction of a paper's title and abstract."""
+    title = ""
+    title_match = re.search(r"\[Title:\s*(.*?)\]", full_text)
+    if title_match and title_match.group(1).strip():
+        title = title_match.group(1).strip()
+    else:
+        for line in full_text.splitlines():
+            cleaned = line.strip().lstrip("[").rstrip("]")
+            if cleaned and not cleaned.lower().startswith(("page ", "title", "authors")):
+                title = cleaned[:200]
+                break
+
+    abstract = ""
+    abstract_match = re.search(
+        r"abstract\s*[:.]?\s*\n(.+?)(?:\n\s*\n|\n(?:1\.?\s*)?introduction)",
+        full_text,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if abstract_match:
+        abstract = re.sub(r"\s+", " ", abstract_match.group(1)).strip()[:1000]
+
+    return title, abstract
+
+
 def _render_source_citations(
     indices: list[int],
     chunks: list[str],
     scores: list[float] | None = None,
+    doc_names: list[str] | None = None,
 ) -> None:
     """Render retrieved source chunks safely with section names and scores."""
 
@@ -591,6 +715,7 @@ def _render_source_citations(
         return
 
     section_list = ", ".join(f"§{i}" for i in indices)
+    multi_doc = doc_names is not None and len(set(doc_names)) > 1
 
     with st.expander(
         f"Sources · {section_list}",
@@ -606,18 +731,20 @@ def _render_source_citations(
             if scores and position < len(scores):
                 score_text = f" · Score: {scores[position]:.3f}"
 
+            doc_label = ""
+            if multi_doc and doc_names and position < len(doc_names):
+                doc_label = f"{html.escape(doc_names[position])} · "
+
             st.markdown(
-                f"**Section {idx}** · *{section_name}*{score_text}"
+                f"**{doc_label}Section {idx}** · *{section_name}*{score_text}"
             )
 
-            # NEW: Format tables nicely
             display_chunk = _format_chunk_for_display(chunk)
             preview = display_chunk[:800]
 
             if len(display_chunk) > 800:
                 preview += "…"
 
-            # Escape HTML while preserving normal markdown
             safe_preview = html.escape(preview)
 
             st.markdown(f"> {safe_preview}")
@@ -626,7 +753,6 @@ def _render_source_citations(
                 st.divider()
 
 
-# NEW: Render faithfulness evaluation results
 def _render_faithfulness(faithfulness: dict[str, Any] | None) -> None:
     """Display faithfulness score and claim details."""
     if not faithfulness:
@@ -638,7 +764,6 @@ def _render_faithfulness(faithfulness: dict[str, Any] | None) -> None:
     unsupported = faithfulness.get("unsupported_claims", [])
     explanation = faithfulness.get("explanation", "")
 
-    # Determine badge class
     if score >= 0.8:
         badge_class = "faith-high"
         label = "● High Faithfulness"
@@ -687,50 +812,21 @@ def _render_empty_state(
 # Retrieval / answer handling
 # ---------------------------------------------------------------------------
 
-def _resolve_answer_result(
-    pipeline: RAGPipeline,
-    question: str,
-    api_key: str,
-):
-    """Return a normalized answer/source pair."""
+def _current_chat_doc_ids() -> list[str] | None:
+    """Doc ids to scope chat retrieval to, or None for search-everything."""
 
-    result = pipeline.answer_question(
-        question,
-        api_key,
-    )
-
-    if hasattr(result, "answer") and hasattr(result, "sources"):
-        return result.answer, result.sources, getattr(result, "faithfulness", None)
-
-    # Defensive fallback for older pipeline objects.
-    answer = str(result)
-    sources = pipeline.retrieve(question)
-
-    if hasattr(sources, "indices"):
-        return answer, sources, None
-
-    chunks = list(sources)
-
-    return (
-        answer,
-        _SourceRefs(
-            chunks=chunks,
-            indices=list(range(1, len(chunks) + 1)),
-        ),
-        None,
-    )
+    active = st.session_state.active_doc_ids
+    return active if active else None
 
 
-# NEW: Generate response with optional faithfulness evaluation
 def _generate_assistant_response(question: str) -> None:
     """Generate one grounded response with optional evaluation."""
 
-    pipeline = st.session_state.pipeline
-
-    if pipeline is None:
+    if not st.session_state.documents:
         st.error("No document is currently loaded.")
         return
 
+    pipeline = _get_pipeline()
     api_key = _get_api_key()
 
     if not api_key:
@@ -740,15 +836,15 @@ def _generate_assistant_response(question: str) -> None:
         )
         return
 
+    doc_ids = _current_chat_doc_ids()
+
     with st.chat_message("assistant", avatar="📚"):
 
         status = st.empty()
 
-        # NEW: Check if evaluation mode is enabled
         evaluate_mode = st.session_state.get("evaluate_faithfulness", False)
 
         if evaluate_mode:
-            # Evaluation mode: non-streaming, but with quality metrics
             status.markdown(
                 '<p class="typing-indicator">'
                 "Retrieving and evaluating answer quality…"
@@ -762,6 +858,7 @@ def _generate_assistant_response(question: str) -> None:
                     api_key,
                     top_k=4,
                     evaluate=True,
+                    doc_ids=doc_ids,
                 )
 
                 answer = result.answer
@@ -779,10 +876,8 @@ def _generate_assistant_response(question: str) -> None:
 
                 st.markdown(answer)
 
-                # NEW: Display faithfulness metrics
                 _render_faithfulness(faithfulness)
 
-                # NEW: Display retrieval details if enabled
                 if st.session_state.get("show_retrieval_details", False):
                     with st.expander("🔍 Retrieval Details"):
                         st.markdown("**Pipeline stages used:**")
@@ -796,15 +891,16 @@ def _generate_assistant_response(question: str) -> None:
                     sources.indices,
                     sources.chunks,
                     getattr(sources, "scores", None),
+                    getattr(sources, "doc_names", None),
                 )
 
-                # Store in history with evaluation data
                 st.session_state.chat_history.append(
                     {
                         "role": "assistant",
                         "content": str(answer),
                         "source_indices": list(sources.indices),
                         "source_chunks": list(sources.chunks),
+                        "source_doc_names": list(sources.doc_names or []),
                         "faithfulness": faithfulness,
                     }
                 )
@@ -821,7 +917,6 @@ def _generate_assistant_response(question: str) -> None:
                 )
 
         else:
-            # Standard mode: streaming for responsiveness
             status.markdown(
                 '<p class="typing-indicator">'
                 "Retrieving relevant sections…"
@@ -834,6 +929,7 @@ def _generate_assistant_response(question: str) -> None:
                     question,
                     api_key,
                     top_k=4,
+                    doc_ids=doc_ids,
                 )
 
                 status.markdown(
@@ -858,6 +954,7 @@ def _generate_assistant_response(question: str) -> None:
                     sources.indices,
                     sources.chunks,
                     getattr(sources, "scores", None),
+                    getattr(sources, "doc_names", None),
                 )
 
                 st.session_state.chat_history.append(
@@ -866,6 +963,7 @@ def _generate_assistant_response(question: str) -> None:
                         "content": str(answer),
                         "source_indices": list(sources.indices),
                         "source_chunks": list(sources.chunks),
+                        "source_doc_names": list(sources.doc_names or []),
                         "faithfulness": None,
                     }
                 )
@@ -901,7 +999,6 @@ def _submit_user_message(question: str) -> None:
     if not question:
         return
 
-    # Prevent accidentally storing enormous prompts.
     question = question[:4000]
 
     st.session_state.chat_history.append(
@@ -941,9 +1038,10 @@ def _render_chat_message(message: dict[str, Any]) -> None:
             _render_source_citations(
                 message["source_indices"],
                 message.get("source_chunks", []),
+                None,
+                message.get("source_doc_names"),
             )
 
-        # NEW: Show faithfulness for past messages too
         if role == "assistant" and message.get("faithfulness"):
             _render_faithfulness(message["faithfulness"])
 
@@ -951,14 +1049,22 @@ def _render_chat_message(message: dict[str, Any]) -> None:
 def _render_chat_welcome() -> None:
     """Render the initial chat welcome."""
 
+    doc_count = len(st.session_state.documents)
+    if st.session_state.active_doc_ids:
+        scope_note = "Scoped to your selected paper(s)."
+    elif doc_count > 1:
+        scope_note = f"Searching across all {doc_count} loaded paper(s)."
+    else:
+        scope_note = (
+            "Scholar retrieves relevant sections from your document "
+            "and generates grounded answers with source references."
+        )
+
     st.markdown(
-        """
+        f"""
         <div class="chat-welcome">
             <h3>Ask anything about your paper</h3>
-            <p>
-                Scholar retrieves relevant sections from your document
-                and generates grounded answers with source references.
-            </p>
+            <p>{html.escape(scope_note)}</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -992,10 +1098,38 @@ def _render_example_questions() -> None:
                 _submit_user_message(example)
 
 
+def _render_chat_scope_picker() -> None:
+    """Let the user scope chat to specific loaded documents."""
+
+    doc_items = list(st.session_state.documents.items())
+    labels = [meta["name"] for _, meta in doc_items]
+    ids = [doc_id for doc_id, _ in doc_items]
+
+    current_active = st.session_state.active_doc_ids
+    default_selection = (
+        [labels[ids.index(d)] for d in current_active if d in ids]
+        if current_active
+        else labels
+    )
+
+    selected_labels = st.multiselect(
+        "Chat scope — which papers should Scholar search?",
+        options=labels,
+        default=default_selection,
+        help="Leave all selected to search across every loaded paper.",
+    )
+
+    selected_ids = [ids[labels.index(lbl)] for lbl in selected_labels]
+
+    st.session_state.active_doc_ids = (
+        [] if len(selected_ids) == len(labels) else selected_ids
+    )
+
+
 def _render_chat_tab() -> None:
     """Render the chat interface."""
 
-    if not st.session_state.pdf_processed:
+    if not st.session_state.documents:
         st.markdown(
             '<p class="section-title">Chat</p>',
             unsafe_allow_html=True,
@@ -1037,6 +1171,9 @@ def _render_chat_tab() -> None:
                 st.session_state.chat_history = []
                 st.rerun()
 
+    if len(st.session_state.documents) > 1:
+        _render_chat_scope_picker()
+
     with st.container(border=True):
 
         if not st.session_state.chat_history:
@@ -1047,7 +1184,6 @@ def _render_chat_tab() -> None:
             for message in st.session_state.chat_history:
                 _render_chat_message(message)
 
-        # Only generate when the newest message is unanswered.
         if _chat_needs_response():
             question = st.session_state.chat_history[-1]["content"]
 
@@ -1096,19 +1232,22 @@ def _process_pdf(
     uploaded_file,
     file_key: str,
 ) -> None:
-    """Extract, chunk, embed, and index one PDF."""
+    """Extract, chunk, embed, and index one PDF as a library document."""
 
     if st.session_state.processing:
+        return
+
+    if len(st.session_state.documents) >= MAX_DOCUMENTS:
+        st.warning(
+            f"You've reached the {MAX_DOCUMENTS}-document limit for this "
+            "session. Remove a paper from the sidebar before adding another."
+        )
         return
 
     st.session_state.processing = True
 
     try:
         _validate_uploaded_file(uploaded_file)
-
-        # Make sure a previous document cannot remain active if
-        # processing the new document fails.
-        _reset_document_state()
 
         uploaded_file.seek(0)
 
@@ -1139,38 +1278,33 @@ def _process_pdf(
 
             st.write(PROCESSING_STEPS[2])
 
-            embedder = _load_embedder()
-
-            pipeline = RAGPipeline(
-                embedder=embedder
-            )
+            pipeline = _get_pipeline()
 
             st.write(PROCESSING_STEPS[3])
 
-            pipeline.index_chunks(chunks)
+            pipeline.index_chunks(
+                chunks,
+                document_id=file_key,
+                document_name=uploaded_file.name,
+            )
 
             status.update(
                 label="Document ready",
                 state="complete",
             )
 
-        # Commit state only after the complete pipeline succeeds.
-        st.session_state.pipeline = pipeline
-        st.session_state.full_text = full_text
-        st.session_state.chunks = chunks
-        st.session_state.chat_history = []
-        st.session_state.summary = ""
-        st.session_state.citations = ""
-        st.session_state.pdf_processed = True
-        st.session_state.last_upload_key = file_key
-        st.session_state.last_filename = uploaded_file.name
-        st.session_state.failed_file_key = ""
-
-        # NEW: Count tables and figures for metrics
         table_count = sum(1 for c in chunks if "[Table" in c)
         figure_count = sum(1 for c in chunks if "[Figure" in c)
-        st.session_state["table_count"] = table_count
-        st.session_state["figure_count"] = figure_count
+
+        st.session_state.documents[file_key] = {
+            "name": uploaded_file.name,
+            "full_text": full_text,
+            "chunk_count": len(chunks),
+            "table_count": table_count,
+            "figure_count": figure_count,
+        }
+        st.session_state.focused_doc_id = file_key
+        st.session_state.failed_upload_key = ""
 
         st.success(
             f"Document indexed successfully — "
@@ -1179,19 +1313,19 @@ def _process_pdf(
 
     except PDFProcessingError as exc:
 
-        st.session_state.failed_file_key = file_key
+        st.session_state.failed_upload_key = file_key
 
         st.error(str(exc))
 
     except RAGPipelineError as exc:
 
-        st.session_state.failed_file_key = file_key
+        st.session_state.failed_upload_key = file_key
 
         st.error(str(exc))
 
     except MemoryError:
 
-        st.session_state.failed_file_key = file_key
+        st.session_state.failed_upload_key = file_key
 
         st.error(
             "The document is too large for the available memory. "
@@ -1200,9 +1334,8 @@ def _process_pdf(
 
     except Exception:
 
-        st.session_state.failed_file_key = file_key
+        st.session_state.failed_upload_key = file_key
 
-        # Deliberately do not expose raw exception details.
         st.error(
             "The document could not be processed. "
             "Try a smaller or different PDF."
@@ -1215,6 +1348,43 @@ def _process_pdf(
 # ---------------------------------------------------------------------------
 # Sidebar
 # ---------------------------------------------------------------------------
+
+def _render_document_library() -> None:
+    """List loaded documents with focus/remove controls."""
+
+    if not st.session_state.documents:
+        return
+
+    st.markdown("**Your papers**")
+
+    for doc_id, meta in list(st.session_state.documents.items()):
+        is_focused = doc_id == st.session_state.focused_doc_id
+        chip_class = "doc-chip doc-chip-focused" if is_focused else "doc-chip"
+
+        col_info, col_focus, col_remove = st.columns([5, 1, 1])
+
+        with col_info:
+            display_name = meta["name"][:32] + ("…" if len(meta["name"]) > 32 else "")
+            st.markdown(
+                f"<div class='{chip_class}'><span style='overflow-wrap:anywhere;'>"
+                f"{html.escape(display_name)}</span></div>",
+                unsafe_allow_html=True,
+            )
+
+        with col_focus:
+            if st.button(
+                "●" if is_focused else "◎",
+                key=f"focus_{doc_id}",
+                help="Set as focused document for Summary/Citations/Related",
+            ):
+                st.session_state.focused_doc_id = doc_id
+                st.rerun()
+
+        with col_remove:
+            if st.button("✕", key=f"remove_{doc_id}", help="Remove this paper"):
+                _remove_document(doc_id)
+                st.rerun()
+
 
 def _render_sidebar() -> None:
     """Render upload controls and application information."""
@@ -1234,25 +1404,23 @@ def _render_sidebar() -> None:
             key="dark_mode",
         )
 
-        # NEW: Evaluation toggle (opt-in to save API quota)
         st.toggle(
             "Evaluate answer faithfulness",
             key="evaluate_faithfulness",
             help="Uses one extra Gemini call per answer to verify claims against sources. Enable when testing quality.",
         )
 
-        # NEW: Retrieval details toggle
         st.toggle(
             "Show retrieval details",
             key="show_retrieval_details",
             help="Display technical information about which retrieval stages were used.",
         )
 
-        if st.session_state.pdf_processed:
+        if st.session_state.documents:
 
             st.markdown(
                 '<span class="status-pill status-ready">'
-                "● Document ready"
+                f"● {len(st.session_state.documents)} paper(s) ready"
                 "</span>",
                 unsafe_allow_html=True,
             )
@@ -1266,81 +1434,63 @@ def _render_sidebar() -> None:
                 unsafe_allow_html=True,
             )
 
-        uploaded_file = st.file_uploader(
-            "Upload a research paper (PDF)",
+        uploaded_files = st.file_uploader(
+            "Upload research papers (PDF)",
             type=["pdf"],
+            accept_multiple_files=True,
             help=(
-                f"Upload one academic PDF. "
-                f"Maximum size: {MAX_PDF_SIZE_MB} MB."
+                f"Upload academic PDFs. "
+                f"Maximum size per file: {MAX_PDF_SIZE_MB} MB."
             ),
+            # Versioned key resets the widget after a successful upload
+            # so its own "selected file" chip doesn't sit duplicated
+            # above the "Your papers" library list below it.
+            key=f"uploader_{st.session_state.get('uploader_version', 0)}",
         )
 
-        if uploaded_file is not None:
+        if uploaded_files:
+            any_new_processed = False
 
-            file_key = (
-                f"{uploaded_file.name}:"
-                f"{uploaded_file.size}"
-            )
+            for uploaded_file in uploaded_files:
 
-            is_new_file = (
-                st.session_state.get("last_upload_key")
-                != file_key
-            )
-
-            if is_new_file:
-
-                st.session_state.failed_file_key = ""
-
-                # If a different document is uploaded,
-                # immediately clear the old document state.
-                if st.session_state.pdf_processed:
-                    _reset_document_state()
-
-                st.session_state.last_upload_key = file_key
-
-            if (
-                st.session_state.failed_file_key == file_key
-            ):
-
-                st.warning(
-                    "The last processing attempt failed."
+                file_key = (
+                    f"{uploaded_file.name}:"
+                    f"{uploaded_file.size}"
                 )
 
-                if st.button(
-                    "Retry processing",
-                    use_container_width=True,
-                ):
-                    st.session_state.failed_file_key = ""
-                    st.rerun()
+                if file_key in st.session_state.documents:
+                    continue
 
-            elif not st.session_state.pdf_processed:
+                if st.session_state.failed_upload_key == file_key:
 
-                _process_pdf(
-                    uploaded_file,
-                    file_key,
+                    st.warning(
+                        f"Processing failed for {uploaded_file.name}."
+                    )
+
+                    if st.button(
+                        "Retry processing",
+                        key=f"retry_{file_key}",
+                        use_container_width=True,
+                    ):
+                        st.session_state.failed_upload_key = ""
+                        _process_pdf(uploaded_file, file_key)
+                        st.rerun()
+
+                else:
+                    _process_pdf(uploaded_file, file_key)
+                    if file_key in st.session_state.documents:
+                        any_new_processed = True
+
+            if any_new_processed:
+                st.session_state.uploader_version = (
+                    st.session_state.get("uploader_version", 0) + 1
                 )
+                st.rerun()
 
-        else:
-
-            # Don't destroy the active document merely because
-            # Streamlit temporarily returns no uploader value.
-            pass
-
-        if st.session_state.pdf_processed:
-
-            st.caption(
-                f"**Active file:** "
-                f"{st.session_state.get('last_filename', '—')}"
-            )
-
-            st.caption(
-                f"{len(st.session_state.chunks):,} "
-                "retrieval chunks"
-            )
+        _render_document_library()
 
         st.divider()
 
-        # NEW: Updated about box mentioning advanced features
         st.markdown(
             """
             <div class="about-box">
@@ -1349,14 +1499,14 @@ def _render_sidebar() -> None:
                 BM25 keyword retrieval + <strong>Cross-encoder re-ranking</strong>
                 + Gemini generation.<br><br>
                 <strong>Advanced features:</strong><br>
+                • Multi-document chat scoping<br>
                 • Section-aware chunking<br>
                 • Table & figure extraction<br>
-                • Query decomposition<br>
                 • Faithfulness evaluation<br>
-                • Persistent vector storage<br><br>
+                • Related-paper discovery (Semantic Scholar)<br><br>
                 PDFs and embeddings remain local.
-                Gemini is only called when you explicitly
-                request an AI-generated response.
+                Gemini and Semantic Scholar are only called
+                when you explicitly request it.
             </div>
             """,
             unsafe_allow_html=True,
@@ -1368,18 +1518,21 @@ def _render_sidebar() -> None:
 # ---------------------------------------------------------------------------
 
 def _render_document_metrics() -> None:
-    """Display basic document statistics."""
+    """Display basic statistics for the focused document."""
 
-    if not st.session_state.pdf_processed:
+    if not st.session_state.documents:
         return
 
-    # NEW: 4 columns instead of 3 to show tables/figures
+    doc_id = st.session_state.focused_doc_id
+    if doc_id not in st.session_state.documents:
+        doc_id = next(iter(st.session_state.documents))
+        st.session_state.focused_doc_id = doc_id
+
+    meta = st.session_state.documents[doc_id]
+
     col1, col2, col3, col4 = st.columns(4)
 
-    filename = st.session_state.get(
-        "last_filename",
-        "Document",
-    )
+    filename = meta.get("name", "Document")
 
     with col1:
         st.metric(
@@ -1391,23 +1544,19 @@ def _render_document_metrics() -> None:
     with col2:
         st.metric(
             "Chunks",
-            f"{len(st.session_state.chunks):,}",
+            f"{meta.get('chunk_count', 0):,}",
         )
 
     with col3:
-        # NEW: Show table count if available
-        table_count = st.session_state.get("table_count", 0)
         st.metric(
             "Tables",
-            f"{table_count}",
+            f"{meta.get('table_count', 0)}",
         )
 
     with col4:
-        # NEW: Show figure count if available
-        figure_count = st.session_state.get("figure_count", 0)
         st.metric(
             "Figures",
-            f"{figure_count}",
+            f"{meta.get('figure_count', 0)}",
         )
 
 
@@ -1418,19 +1567,54 @@ def _render_document_metrics() -> None:
 def _render_hero() -> None:
     """Render application header."""
 
+    doc_count = len(st.session_state.documents)
+    subtitle = (
+        "AI-powered research paper assistant — "
+        "ask questions, generate summaries, "
+        "and explore citations grounded in your document."
+    )
+    if doc_count > 1:
+        subtitle = (
+            f"{doc_count} papers loaded — ask questions across your "
+            "library, generate summaries, explore citations, and "
+            "discover related work."
+        )
+
     st.markdown(
-        """
+        f"""
         <div class="scholar-hero">
             <h1>Scholar</h1>
-            <p>
-                AI-powered research paper assistant —
-                ask questions, generate summaries,
-                and explore citations grounded in your document.
-            </p>
+            <p>{html.escape(subtitle)}</p>
         </div>
         """,
         unsafe_allow_html=True,
     )
+
+
+def _render_focused_doc_picker(purpose: str) -> str | None:
+    """Let the user pick which loaded document a per-document tab targets."""
+
+    if not st.session_state.documents:
+        return None
+
+    doc_items = list(st.session_state.documents.items())
+    labels = [meta["name"] for _, meta in doc_items]
+    ids = [doc_id for doc_id, _ in doc_items]
+
+    current = st.session_state.focused_doc_id
+    default_index = ids.index(current) if current in ids else 0
+
+    if len(doc_items) > 1:
+        selected_label = st.selectbox(
+            f"Document for {purpose}",
+            options=labels,
+            index=default_index,
+        )
+        selected_id = ids[labels.index(selected_label)]
+        st.session_state.focused_doc_id = selected_id
+        return selected_id
+
+    return ids[0]
 
 
 # ---------------------------------------------------------------------------
@@ -1438,7 +1622,7 @@ def _render_hero() -> None:
 # ---------------------------------------------------------------------------
 
 def _render_summary_tab() -> None:
-    """Render structured paper summary."""
+    """Render structured paper summary for the focused document."""
 
     st.markdown(
         '<p class="section-title">Paper Summary</p>',
@@ -1453,7 +1637,7 @@ def _render_summary_tab() -> None:
         unsafe_allow_html=True,
     )
 
-    if not st.session_state.pdf_processed:
+    if not st.session_state.documents:
 
         _render_empty_state(
             "No document loaded",
@@ -1462,27 +1646,25 @@ def _render_summary_tab() -> None:
 
         return
 
-    if st.session_state.summary:
+    doc_id = _render_focused_doc_picker("summary")
+    meta = st.session_state.documents[doc_id]
+    summary = meta.get("summary", "")
+
+    if summary:
 
         with st.container(border=True):
-            st.markdown(
-                st.session_state.summary
-            )
+            st.markdown(summary)
 
         col1, col2, col3 = st.columns(
             [1, 1, 1]
         )
 
-        filename = (
-            st.session_state
-            .get("last_filename", "paper")
-            .rsplit(".", 1)[0]
-        )
+        filename = meta["name"].rsplit(".", 1)[0]
 
         with col1:
             st.download_button(
                 "Download .md",
-                st.session_state.summary,
+                summary,
                 file_name=f"{filename}_summary.md",
                 mime="text/markdown",
                 use_container_width=True,
@@ -1491,7 +1673,7 @@ def _render_summary_tab() -> None:
         with col2:
             st.download_button(
                 "Download .txt",
-                st.session_state.summary,
+                summary,
                 file_name=f"{filename}_summary.txt",
                 mime="text/plain",
                 use_container_width=True,
@@ -1503,7 +1685,7 @@ def _render_summary_tab() -> None:
                 type="secondary",
                 use_container_width=True,
             ):
-                st.session_state.summary = ""
+                st.session_state.documents[doc_id]["summary"] = ""
                 st.rerun()
 
         return
@@ -1536,15 +1718,17 @@ def _render_summary_tab() -> None:
                     "Generating structured summary…"
                 )
 
+                pipeline = _get_pipeline()
+
                 summary = generate_structured_summary(
-                    st.session_state.full_text,
-                    st.session_state.pipeline,
+                    meta["full_text"],
+                    pipeline,
                     api_key,
                 )
 
                 progress.empty()
 
-                st.session_state.summary = summary
+                st.session_state.documents[doc_id]["summary"] = summary
 
                 st.rerun()
 
@@ -1569,7 +1753,7 @@ def _render_summary_tab() -> None:
 # ---------------------------------------------------------------------------
 
 def _render_citations_tab() -> None:
-    """Render extracted bibliography."""
+    """Render extracted bibliography for the focused document."""
 
     st.markdown(
         '<p class="section-title">Key Citations</p>',
@@ -1584,7 +1768,7 @@ def _render_citations_tab() -> None:
         unsafe_allow_html=True,
     )
 
-    if not st.session_state.pdf_processed:
+    if not st.session_state.documents:
 
         _render_empty_state(
             "No document loaded",
@@ -1593,27 +1777,25 @@ def _render_citations_tab() -> None:
 
         return
 
-    if st.session_state.citations:
+    doc_id = _render_focused_doc_picker("citations")
+    meta = st.session_state.documents[doc_id]
+    citations = meta.get("citations", "")
+
+    if citations:
 
         with st.container(border=True):
-            st.markdown(
-                st.session_state.citations
-            )
+            st.markdown(citations)
 
         col1, col2, col3 = st.columns(
             [1, 1, 1]
         )
 
-        filename = (
-            st.session_state
-            .get("last_filename", "paper")
-            .rsplit(".", 1)[0]
-        )
+        filename = meta["name"].rsplit(".", 1)[0]
 
         with col1:
             st.download_button(
                 "Download .md",
-                st.session_state.citations,
+                citations,
                 file_name=f"{filename}_citations.md",
                 mime="text/markdown",
                 use_container_width=True,
@@ -1622,7 +1804,7 @@ def _render_citations_tab() -> None:
         with col2:
             st.download_button(
                 "Download .txt",
-                st.session_state.citations,
+                citations,
                 file_name=f"{filename}_citations.txt",
                 mime="text/plain",
                 use_container_width=True,
@@ -1635,7 +1817,7 @@ def _render_citations_tab() -> None:
                 type="secondary",
                 use_container_width=True,
             ):
-                st.session_state.citations = ""
+                st.session_state.documents[doc_id]["citations"] = ""
                 st.rerun()
 
         return
@@ -1668,15 +1850,17 @@ def _render_citations_tab() -> None:
                     "Locating References section…"
                 )
 
+                pipeline = _get_pipeline()
+
                 citations = format_citations(
-                    st.session_state.full_text,
-                    st.session_state.pipeline,
+                    meta["full_text"],
+                    pipeline,
                     api_key,
                 )
 
                 progress.empty()
 
-                st.session_state.citations = citations
+                st.session_state.documents[doc_id]["citations"] = citations
 
                 st.rerun()
 
@@ -1694,6 +1878,120 @@ def _render_citations_tab() -> None:
                     "The references could not be extracted. "
                     "Please try again."
                 )
+
+
+# ---------------------------------------------------------------------------
+# Related papers
+# ---------------------------------------------------------------------------
+
+def _render_related_card(paper: RelatedPaper) -> None:
+    """Render one related-paper result card."""
+
+    authors_text = ", ".join(paper.authors[:4])
+    if len(paper.authors) > 4:
+        authors_text += " et al."
+
+    meta_parts = [p for p in [authors_text, str(paper.year) if paper.year else ""] if p]
+    if paper.citation_count is not None:
+        meta_parts.append(f"{paper.citation_count:,} citations")
+    meta_line = " · ".join(meta_parts)
+
+    abstract_preview = paper.abstract[:280] + ("…" if len(paper.abstract) > 280 else "")
+
+    link_html = (
+        f'<a href="{html.escape(paper.url)}" target="_blank" '
+        f'style="font-size:0.8rem;">View on Semantic Scholar →</a>'
+        if paper.url else ""
+    )
+
+    st.markdown(
+        f"""
+        <div class="related-card">
+            <div class="related-card-title">{html.escape(paper.title)}</div>
+            <div class="related-card-meta">{html.escape(meta_line)}</div>
+            <div class="related-card-abstract">{html.escape(abstract_preview)}</div>
+            <div style="margin-top:0.5rem;">{link_html}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_related_tab() -> None:
+    """Render related-papers discovery for the focused document."""
+
+    st.markdown(
+        '<p class="section-title">Related Papers</p>',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        '<p class="section-subtitle">'
+        "Discover related work via Semantic Scholar, based on this "
+        "paper's title and abstract."
+        "</p>",
+        unsafe_allow_html=True,
+    )
+
+    if not st.session_state.documents:
+
+        _render_empty_state(
+            "No document loaded",
+            "Upload a PDF to find related work.",
+        )
+
+        return
+
+    doc_id = _render_focused_doc_picker("related papers")
+    meta = st.session_state.documents[doc_id]
+
+    cached = st.session_state.related_papers_cache.get(doc_id)
+
+    if cached:
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            st.caption(f"Related to: {meta['name']}")
+        with col2:
+            if st.button("Refresh", use_container_width=True):
+                st.session_state.related_papers_cache.pop(doc_id, None)
+                st.rerun()
+
+        for paper in cached:
+            _render_related_card(paper)
+        return
+
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        if st.button("Find Related Papers", type="primary", use_container_width=True):
+            title, abstract = _extract_title_and_abstract(meta["full_text"])
+
+            if not title:
+                st.error("Could not identify this paper's title to search from.")
+                return
+
+            progress = st.empty()
+            try:
+                progress.caption("Searching Semantic Scholar…")
+                results = find_related_papers(
+                    title=title,
+                    abstract=abstract,
+                    limit=6,
+                    exclude_title=title,
+                )
+                progress.empty()
+
+                if not results:
+                    st.info("No related papers were found for this document.")
+                else:
+                    st.session_state.related_papers_cache[doc_id] = results
+                    st.rerun()
+
+            except SemanticScholarError as exc:
+                progress.empty()
+                st.error(str(exc))
+            except Exception:
+                progress.empty()
+                st.error("Could not fetch related papers. Please try again.")
 
 
 # ---------------------------------------------------------------------------
@@ -1727,11 +2025,12 @@ def main() -> None:
 
     _render_document_metrics()
 
-    tab_chat, tab_summary, tab_citations = st.tabs(
+    tab_chat, tab_summary, tab_citations, tab_related = st.tabs(
         [
             "Chat",
             "Summary",
             "Citations",
+            "Related",
         ]
     )
 
@@ -1744,10 +2043,13 @@ def main() -> None:
     with tab_citations:
         _render_citations_tab()
 
+    with tab_related:
+        _render_related_tab()
+
     st.markdown(
         '<p class="scholar-footer">'
         "Scholar · Advanced Hybrid RAG · "
-        "Dense + Sparse + Cross-Encoder + Faithfulness Eval"
+        "Dense + Sparse + Cross-Encoder + Faithfulness Eval + Related Papers"
         "</p>",
         unsafe_allow_html=True,
     )

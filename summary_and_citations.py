@@ -587,10 +587,12 @@ FORMATTED REFERENCES:
         return pipeline.generate_with_prompt(
             prompt,
             api_key,
-            # Raised from 3000 -> 6000. A full reference list needs
-            # real room to be fully re-numbered and formatted without
-            # cutting off partway through.
-            max_tokens=6000,
+            # CHANGED: raised again, 6000 -> 12000. Formatting a full
+            # reference list (30+ entries here) still hit the ceiling
+            # at 6000 once Gemini's hidden "thinking" tokens ate into
+            # the same budget — this task needs more headroom than a
+            # single chat answer or a 4-section summary.
+            max_tokens=12000,
         )
 
     try:

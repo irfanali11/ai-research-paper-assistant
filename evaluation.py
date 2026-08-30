@@ -143,7 +143,7 @@ def _run_retrieval_test(
         expected = [s.lower() for s in case.get("expected_sections", [])]
         section_hit = any(s in retrieved_sections for s in expected)
 
-        # NEW: Get cross-encoder scores if available
+        # Get cross-encoder scores if available
         # We re-run retrieve to get scores (lightweight, no LLM)
         try:
             detailed = pipeline.retrieve(case["question"], top_k=top_k)
@@ -283,7 +283,7 @@ def _print_faithfulness_report(faithfulness_results: list[dict[str, object]]) ->
         unsupported = result.get("unsupported_claims", [])
         if unsupported:
             for claim in unsupported:
-                print(f"  ⚠️  Unsupported: {claim}")
+                print(f"  \u26a0\ufe0f  Unsupported: {claim}")
 
     avg_score = total_score / len(faithfulness_results) if faithfulness_results else 0.0
 
@@ -310,6 +310,7 @@ def _save_benchmark(
             "diversity_filter",
             "section_aware_chunking",
             "table_extraction",
+            "multi_document_support",
         ],
         "retrieval_evaluation": retrieval_results,
     }
@@ -358,7 +359,13 @@ def run_evaluation(
 
     pipeline = RAGPipeline()
     print("Generating local embeddings and building indices...")
-    pipeline.index_chunks(chunks)
+
+    # CHANGED: index_chunks() now requires a document_id and
+    # document_name since the pipeline supports multiple documents
+    # in one collection. A single-shot CLI eval run just needs a
+    # stable id, so the file path/name is reused for both.
+    doc_name = Path(pdf_path).name
+    pipeline.index_chunks(chunks, document_id=doc_name, document_name=doc_name)
 
     # --- Retrieval evaluation (always runs, no API cost) ---
     retrieval_results = _run_retrieval_test(
@@ -376,7 +383,7 @@ def run_evaluation(
 
         if not api_key:
             print(
-                "\n⚠️  GEMINI_API_KEY not set. "
+                "\n\u26a0\ufe0f  GEMINI_API_KEY not set. "
                 "Skipping faithfulness evaluation."
             )
             print("Set it with: export GEMINI_API_KEY='your-key'")
