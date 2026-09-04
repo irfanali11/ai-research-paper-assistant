@@ -593,11 +593,95 @@ JSON:"""
     # RETRIEVAL (UPDATED with cross-encoder + decomposition)
     # ------------------------------------------------------------------
 
+    def _search_candidates(
+        self,
+        question: str,
+        doc_ids: list[str] | None,
+        allowed_positions: set[int] | None,
+        candidate_count: int,
+        pool_size: int,
+    ) -> list[int]:
+        """Run dense + BM25 search for ONE question and RRF-fuse the two.
+
+        Returns a ranked list of internal chunk positions (indices into
+        self._chunks). This is the reusable "search for one query" step
+        — retrieve() calls it once per sub-question when decomposition
+        is enabled, then fuses ACROSS those results with another RRF
+        pass (see retrieve()).
+        """
+        # ------------------------------------------------------
+        # Semantic retrieval (dense)
+        # ------------------------------------------------------
+        # BGE models expect a query instruction prefix for retrieval
+        # tasks. Applied ONLY to the query, never to stored chunks.
+        query_embedding = self._embedder.encode(
+            [BGE_QUERY_PREFIX + question],
+            show_progress_bar=False,
+            normalize_embeddings=True,
+        ).tolist()
+
+        chroma_where = (
+            {"document_id": {"$in": doc_ids}} if doc_ids is not None else None
+        )
+
+        try:
+            vector_results = self._collection.query(
+                query_embeddings=query_embedding,
+                n_results=candidate_count,
+                where=chroma_where,
+                include=["metadatas"],
+            )
+        except Exception as exc:
+            raise RAGPipelineError(
+                "Vector retrieval failed. Please re-upload the PDF."
+            ) from exc
+
+        # Chroma ids are "document_id::N" strings (needed to keep
+        # multiple documents' chunks distinct in one collection), so
+        # they can't be parsed with int(id). Each chunk's position in
+        # self._chunks is instead carried as "global_index" metadata.
+        vector_metadatas = vector_results.get("metadatas", [[]])[0] or []
+        vector_ids = [
+            int(meta["global_index"])
+            for meta in vector_metadatas
+            if meta and "global_index" in meta
+        ]
+
+        # ------------------------------------------------------
+        # BM25 retrieval (sparse)
+        # ------------------------------------------------------
+        bm25_ids: list[int] = []
+        if self._bm25 is not None:
+            query_tokens = self._tokenize(question)
+            bm25_scores = self._bm25.get_scores(query_tokens)
+
+            scored_positions = range(len(bm25_scores))
+            if allowed_positions is not None:
+                scored_positions = [
+                    i for i in scored_positions if i in allowed_positions
+                ]
+
+            bm25_ids = sorted(
+                scored_positions,
+                key=lambda index: bm25_scores[index],
+                reverse=True,
+            )[:candidate_count]
+
+        # ------------------------------------------------------
+        # Hybrid fusion (RRF) — dense + sparse for THIS ONE question
+        # ------------------------------------------------------
+        return self._reciprocal_rank_fusion(
+            [vector_ids, bm25_ids],
+            top_k=min(candidate_count, pool_size),
+        )
+
     def retrieve(
         self,
         question: str,
         top_k: int = DEFAULT_TOP_K,
         doc_ids: list[str] | None = None,
+        decompose: bool = False,
+        api_key: str | None = None,
     ) -> RetrievalResult:
         """Retrieve relevant chunks using hybrid search + neural re-ranking.
 
@@ -607,6 +691,15 @@ JSON:"""
             doc_ids: Optional list of document_id values to scope
                 retrieval to. None (default) searches across every
                 loaded document.
+            decompose: NEW. If True, breaks compound/comparative
+                questions into standalone sub-questions (via
+                _decompose_query), retrieves for each sub-question
+                separately, and fuses all results together with RRF
+                before final reranking. Simple questions are detected
+                internally and skip decomposition automatically (no
+                extra LLM call in that case). Requires api_key.
+            api_key: Required only when decompose=True, since splitting
+                the question uses one Gemini call.
         """
         question = self._validate_query(question, doc_ids=doc_ids)
 
@@ -638,79 +731,47 @@ JSON:"""
             )
 
         # ----------------------------------------------------------
-        # Semantic retrieval (dense)
+        # NEW: Query decomposition. _decompose_query() has its own
+        # fast-path heuristic that returns [question] unchanged for
+        # simple questions without calling the LLM, so this only
+        # costs an extra Gemini call on genuinely compound questions.
         # ----------------------------------------------------------
-        # CHANGED: BGE models expect a query instruction prefix for
-        # retrieval tasks. This is applied ONLY to the query, never
-        # to stored document/chunk embeddings (see index_chunks()).
-        query_embedding = self._embedder.encode(
-            [BGE_QUERY_PREFIX + question],
-            show_progress_bar=False,
-            normalize_embeddings=True,
-        ).tolist()
+        if decompose and api_key:
+            sub_questions = self._decompose_query(question, api_key)
+        else:
+            sub_questions = [question]
 
-        chroma_where = (
-            {"document_id": {"$in": doc_ids}} if doc_ids is not None else None
-        )
+        if len(sub_questions) <= 1:
+            candidate_lists = [
+                self._search_candidates(
+                    question, doc_ids, allowed_positions,
+                    candidate_count, pool_size,
+                )
+            ]
+        else:
+            # One dense+BM25 search PER sub-question, each independently
+            # RRF-fused, then all of those ranked lists get fused
+            # together again below — same RRF algorithm, one more layer.
+            candidate_lists = [
+                self._search_candidates(
+                    sub_q, doc_ids, allowed_positions,
+                    candidate_count, pool_size,
+                )
+                for sub_q in sub_questions
+            ]
 
-        try:
-            vector_results = self._collection.query(
-                query_embeddings=query_embedding,
-                n_results=candidate_count,
-                where=chroma_where,
-                include=["metadatas"],
-            )
-        except Exception as exc:
-            raise RAGPipelineError(
-                "Vector retrieval failed. Please re-upload the PDF."
-            ) from exc
-
-        # CHANGED (bug fix): chroma ids are now "document_id::N" strings
-        # (needed to keep multiple documents' chunks distinct in one
-        # collection), so they can no longer be parsed with int(id).
-        # Each chunk's position in the in-memory self._chunks list is
-        # instead carried explicitly as "global_index" metadata, set
-        # once at index time and never re-derived from the id string.
-        vector_metadatas = vector_results.get("metadatas", [[]])[0] or []
-        vector_ids = [
-            int(meta["global_index"])
-            for meta in vector_metadatas
-            if meta and "global_index" in meta
-        ]
-
-        # ----------------------------------------------------------
-        # BM25 retrieval (sparse)
-        # ----------------------------------------------------------
-        bm25_ids: list[int] = []
-        if self._bm25 is not None:
-            query_tokens = self._tokenize(question)
-            bm25_scores = self._bm25.get_scores(query_tokens)
-
-            scored_positions = range(len(bm25_scores))
-            if allowed_positions is not None:
-                scored_positions = [
-                    i for i in scored_positions if i in allowed_positions
-                ]
-
-            bm25_ids = sorted(
-                scored_positions,
-                key=lambda index: bm25_scores[index],
-                reverse=True,
-            )[:candidate_count]
-
-        # ----------------------------------------------------------
-        # Hybrid fusion (RRF)
-        # ----------------------------------------------------------
         fused_candidates = self._reciprocal_rank_fusion(
-            [vector_ids, bm25_ids],
+            candidate_lists,
             top_k=min(candidate_count, pool_size),
         )
 
         # ----------------------------------------------------------
-        # NEW: Cross-encoder neural re-ranking
+        # Cross-encoder neural re-ranking
         # ----------------------------------------------------------
-        # The cross-encoder scores (query, doc) pairs for precision.
-        # We take top 2*top_k, then diversity-filter to final top_k.
+        # IMPORTANT: always rerank against the ORIGINAL full question,
+        # even when sub-questions were used for retrieval — the final
+        # relevance ordering should reflect what the user actually
+        # asked, not any one sub-question in isolation.
         reranked = self._cross_encoder_rerank(
             question,
             fused_candidates,
@@ -727,8 +788,6 @@ JSON:"""
 
         chunks = [self._chunks[index] for index in final_indices]
         display_indices = [index + 1 for index in final_indices]
-        # NEW: which document each returned chunk came from, so the UI
-        # can label sources by paper when multiple documents are loaded.
         doc_names = [
             self._documents.get(self._chunk_doc_ids[index], "Document")
             for index in final_indices
@@ -998,11 +1057,18 @@ ANSWER:
         question: str,
         api_key: str,
         top_k: int = DEFAULT_TOP_K,
-        evaluate: bool = False,  # NEW: enable faithfulness scoring
-        doc_ids: list[str] | None = None,  # NEW: scope to selected papers
+        evaluate: bool = False,
+        doc_ids: list[str] | None = None,
+        decompose: bool = False,  # NEW: split compound questions before retrieving
     ) -> AnswerResult:
         """Retrieve context and generate a grounded answer."""
-        sources = self.retrieve(question, top_k=top_k, doc_ids=doc_ids)
+        sources = self.retrieve(
+            question,
+            top_k=top_k,
+            doc_ids=doc_ids,
+            decompose=decompose,
+            api_key=api_key,
+        )
 
         prompt = self._build_qa_prompt(question, sources.chunks)
         # CHANGED: raised from 1024 -> 4096. Gemini 2.5's internal
@@ -1029,10 +1095,17 @@ ANSWER:
         question: str,
         api_key: str,
         top_k: int = DEFAULT_TOP_K,
-        doc_ids: list[str] | None = None,  # NEW: scope to selected papers
+        doc_ids: list[str] | None = None,
+        decompose: bool = False,  # NEW: split compound questions before retrieving
     ) -> tuple[Iterator[str], RetrievalResult]:
         """Retrieve context and stream a grounded answer."""
-        sources = self.retrieve(question, top_k=top_k, doc_ids=doc_ids)
+        sources = self.retrieve(
+            question,
+            top_k=top_k,
+            doc_ids=doc_ids,
+            decompose=decompose,
+            api_key=api_key,
+        )
 
         prompt = self._build_qa_prompt(question, sources.chunks)
 

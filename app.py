@@ -594,6 +594,7 @@ def _init_session_state() -> None:
         "processing": False,
         "evaluate_faithfulness": False,
         "show_retrieval_details": False,
+        "enable_decomposition": False,
         "related_papers_cache": {},
         "uploader_version": 0,
     }
@@ -859,6 +860,7 @@ def _generate_assistant_response(question: str) -> None:
                     top_k=4,
                     evaluate=True,
                     doc_ids=doc_ids,
+                    decompose=st.session_state.get("enable_decomposition", False),
                 )
 
                 answer = result.answer
@@ -881,6 +883,11 @@ def _generate_assistant_response(question: str) -> None:
                 if st.session_state.get("show_retrieval_details", False):
                     with st.expander("🔍 Retrieval Details"):
                         st.markdown("**Pipeline stages used:**")
+                        if st.session_state.get("enable_decomposition", False):
+                            st.markdown(
+                                "- Query decomposition (splits compound "
+                                "questions into sub-questions when needed)"
+                            )
                         st.markdown("- Dense semantic retrieval (ChromaDB)")
                         st.markdown("- Sparse keyword retrieval (BM25)")
                         st.markdown("- Reciprocal Rank Fusion (RRF)")
@@ -930,6 +937,7 @@ def _generate_assistant_response(question: str) -> None:
                     api_key,
                     top_k=4,
                     doc_ids=doc_ids,
+                    decompose=st.session_state.get("enable_decomposition", False),
                 )
 
                 status.markdown(
@@ -1416,6 +1424,18 @@ def _render_sidebar() -> None:
             help="Display technical information about which retrieval stages were used.",
         )
 
+        st.toggle(
+            "Enable query decomposition",
+            key="enable_decomposition",
+            help=(
+                "For compound/comparative questions (e.g. 'compare X and Y'), "
+                "splits the question into sub-questions and retrieves for each "
+                "separately before answering. Simple questions skip this "
+                "automatically. Uses one extra Gemini call only when the "
+                "question is actually complex."
+            ),
+        )
+
         if st.session_state.documents:
 
             st.markdown(
@@ -1500,6 +1520,7 @@ def _render_sidebar() -> None:
                 + Gemini generation.<br><br>
                 <strong>Advanced features:</strong><br>
                 • Multi-document chat scoping<br>
+                • Query decomposition for compound questions<br>
                 • Section-aware chunking<br>
                 • Table & figure extraction<br>
                 • Faithfulness evaluation<br>
