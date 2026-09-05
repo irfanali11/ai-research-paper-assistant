@@ -883,10 +883,15 @@ def _generate_assistant_response(question: str) -> None:
                 if st.session_state.get("show_retrieval_details", False):
                     with st.expander("🔍 Retrieval Details"):
                         st.markdown("**Pipeline stages used:**")
-                        if st.session_state.get("enable_decomposition", False):
+                        if getattr(sources, "decomposed", False):
                             st.markdown(
-                                "- Query decomposition (splits compound "
-                                "questions into sub-questions when needed)"
+                                f"- Query decomposition — split into "
+                                f"{sources.sub_question_count} sub-questions"
+                            )
+                        elif st.session_state.get("enable_decomposition", False):
+                            st.markdown(
+                                "- Query decomposition — enabled, but this "
+                                "question was simple enough to skip it"
                             )
                         st.markdown("- Dense semantic retrieval (ChromaDB)")
                         st.markdown("- Sparse keyword retrieval (BM25)")
@@ -957,6 +962,31 @@ def _generate_assistant_response(question: str) -> None:
                         "Please try again."
                     )
                     return
+
+                # FIX: this expander previously only existed in the
+                # evaluate-mode branch above, so toggling "Show
+                # retrieval details" had no visible effect unless
+                # "Evaluate answer faithfulness" was ALSO on — the
+                # default streaming path (used whenever faithfulness
+                # eval is off) never showed it.
+                if st.session_state.get("show_retrieval_details", False):
+                    with st.expander("🔍 Retrieval Details"):
+                        st.markdown("**Pipeline stages used:**")
+                        if getattr(sources, "decomposed", False):
+                            st.markdown(
+                                f"- Query decomposition — split into "
+                                f"{sources.sub_question_count} sub-questions"
+                            )
+                        elif st.session_state.get("enable_decomposition", False):
+                            st.markdown(
+                                "- Query decomposition — enabled, but this "
+                                "question was simple enough to skip it"
+                            )
+                        st.markdown("- Dense semantic retrieval (ChromaDB)")
+                        st.markdown("- Sparse keyword retrieval (BM25)")
+                        st.markdown("- Reciprocal Rank Fusion (RRF)")
+                        st.markdown("- Cross-encoder neural re-ranking")
+                        st.markdown("- Diversity filter (Jaccard similarity)")
 
                 _render_source_citations(
                     sources.indices,

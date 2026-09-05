@@ -56,6 +56,13 @@ class RetrievalResult:
     # same length/order as chunks. Lets the UI label "Paper X · §3"
     # when multiple documents are loaded.
     doc_names: list[str] | None = None
+    # NEW: whether query decomposition actually split this question
+    # into multiple sub-questions. The "decompose" flag passed into
+    # retrieve() only enables the *capability* — simple questions skip
+    # it via _decompose_query's fast-path heuristic, so this reports
+    # the real outcome for THIS question, not just the toggle state.
+    decomposed: bool = False
+    sub_question_count: int = 1
 
 
 
@@ -798,6 +805,8 @@ JSON:"""
             indices=display_indices,
             scores=scores,
             doc_names=doc_names,
+            decomposed=len(sub_questions) > 1,
+            sub_question_count=len(sub_questions),
         )
 
     # ------------------------------------------------------------------
