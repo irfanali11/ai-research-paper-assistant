@@ -1251,6 +1251,9 @@ JSON:"""
         self,
         test_cases: list[dict[str, object]],
         top_k: int = DEFAULT_TOP_K,
+        doc_ids: list[str] | None = None,  # NEW: scope evaluation to specific docs
+        decompose: bool = False,  # NEW: exercise query decomposition during eval
+        api_key: str | None = None,  # NEW: required if decompose=True
     ) -> list[dict[str, object]]:
         """Evaluate retrieval using expected keywords.
 
@@ -1266,7 +1269,13 @@ JSON:"""
                 for keyword in case.get("expected_keywords", [])
             ]
 
-            retrieval = self.retrieve(question, top_k=top_k)
+            retrieval = self.retrieve(
+                question,
+                top_k=top_k,
+                doc_ids=doc_ids,
+                decompose=decompose,
+                api_key=api_key,
+            )
 
             combined = " ".join(retrieval.chunks).lower()
 
@@ -1287,6 +1296,10 @@ JSON:"""
                         if keywords
                         else 0.0
                     ),
+                    # NEW: real per-question outcome, not just the flag
+                    "decomposed": retrieval.decomposed,
+                    "sub_question_count": retrieval.sub_question_count,
+                    "doc_names": list(dict.fromkeys(retrieval.doc_names or [])),
                 }
             )
 

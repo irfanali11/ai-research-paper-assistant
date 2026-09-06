@@ -1,0 +1,286 @@
+{
+  "system": "Scholar Advanced RAG",
+  "pipeline_features": [
+    "dense_semantic_retrieval",
+    "sparse_bm25_retrieval",
+    "reciprocal_rank_fusion",
+    "cross_encoder_reranking",
+    "diversity_filter",
+    "section_aware_chunking",
+    "table_extraction",
+    "multi_document_support",
+    "query_decomposition",
+    "faithfulness_evaluation"
+  ],
+  "per_document": {
+    "0354-73100303203T.pdf:51811": {
+      "document_name": "0354-73100303203T.pdf",
+      "retrieval_evaluation": [
+        {
+          "question": "What is the main research question or problem?",
+          "retrieved_indices": [
+            7,
+            1,
+            19,
+            16,
+            4
+          ],
+          "retrieved_sections": [
+            "preamble",
+            "preamble",
+            "preamble",
+            "preamble",
+            "preamble"
+          ],
+          "keyword_hit_rate": 0.75,
+          "keywords_found": [
+            "research",
+            "problem",
+            "question"
+          ],
+          "expected_sections": [
+            "abstract",
+            "introduction",
+            "conclusion"
+          ],
+          "section_match": false,
+          "avg_rerank_score": -6.0168,
+          "rerank_scores": [
+            -3.6563568115234375,
+            -6.268864631652832,
+            -6.564059257507324,
+            -6.758527755737305,
+            -6.8363800048828125
+          ]
+        },
+        {
+          "question": "What methodology or methods were used?",
+          "retrieved_indices": [
+            14,
+            6,
+            13,
+            21,
+            15
+          ],
+          "retrieved_sections": [
+            "preamble",
+            "preamble",
+            "preamble",
+            "preamble",
+            "preamble"
+          ],
+          "keyword_hit_rate": 0.75,
+          "keywords_found": [
+            "method",
+            "data",
+            "analysis"
+          ],
+          "expected_sections": [
+            "methodology",
+            "methods",
+            "materials and methods",
+            "experiments"
+          ],
+          "section_match": false,
+          "avg_rerank_score": -1.7901,
+          "rerank_scores": [
+            0.9891393780708313,
+            -0.3937007486820221,
+            -0.4148060977458954,
+            -3.721217393875122,
+            -5.409947872161865
+          ]
+        },
+        {
+          "question": "What are the key findings or results?",
+          "retrieved_indices": [
+            19,
+            17,
+            7,
+            4,
+            11
+          ],
+          "retrieved_sections": [
+            "preamble",
+            "preamble",
+            "preamble",
+            "preamble",
+            "preamble"
+          ],
+          "keyword_hit_rate": 0.5,
+          "keywords_found": [
+            "result",
+            "finding"
+          ],
+          "expected_sections": [
+            "results",
+            "findings",
+            "discussion",
+            "conclusion"
+          ],
+          "section_match": false,
+          "avg_rerank_score": -3.2442,
+          "rerank_scores": [
+            -2.601078987121582,
+            -2.6568105220794678,
+            -3.046304702758789,
+            -3.7246017456054688,
+            -4.192054271697998
+          ]
+        },
+        {
+          "question": "What limitations does the paper mention?",
+          "retrieved_indices": [
+            1,
+            3,
+            5,
+            2,
+            18
+          ],
+          "retrieved_sections": [
+            "preamble",
+            "preamble",
+            "preamble",
+            "preamble",
+            "preamble"
+          ],
+          "keyword_hit_rate": 0.25,
+          "keywords_found": [
+            "limitation"
+          ],
+          "expected_sections": [
+            "limitations",
+            "discussion",
+            "future work",
+            "conclusion"
+          ],
+          "section_match": false,
+          "avg_rerank_score": -5.1143,
+          "rerank_scores": [
+            -3.937324285507202,
+            -4.971467018127441,
+            -5.3541107177734375,
+            -5.368628978729248,
+            -5.939722061157227
+          ]
+        },
+        {
+          "question": "What is the conclusion of the paper?",
+          "retrieved_indices": [
+            21,
+            20,
+            5,
+            6,
+            7
+          ],
+          "retrieved_sections": [
+            "preamble",
+            "preamble",
+            "preamble",
+            "preamble",
+            "preamble"
+          ],
+          "keyword_hit_rate": 0.0,
+          "keywords_found": [],
+          "expected_sections": [
+            "conclusion",
+            "discussion"
+          ],
+          "section_match": false,
+          "avg_rerank_score": -2.841,
+          "rerank_scores": [
+            -1.2364275455474854,
+            -2.6853318214416504,
+            -2.800449848175049,
+            -3.44028639793396,
+            -4.042705535888672
+          ]
+        }
+      ],
+      "retrieval_summary": {
+        "avg_keyword_hit_rate": 0.45,
+        "section_retrieval_success": 0.0,
+        "avg_rerank_score": -3.8012799999999998
+      },
+      "faithfulness_evaluation": [
+        {
+          "question": "What is the main research question or problem?",
+          "answer": "The main research question or problem of the paper from which the source material is extracted is its aim.\n\nAccording to [SOURCE 1], Section: Preamble:\n*   \"The aim of this paper is to emphasize essential points of these basic sections.\"\n*   The basic sections mentioned are Introduction, Material and method, Results, and Discussion.",
+          "faithfulness_score": 0.67,
+          "total_claims": 3,
+          "supported_claims": 2,
+          "unsupported_claims": [
+            "The main research question or problem of the paper from which the source material is extracted is its aim."
+          ],
+          "explanation": "The claim that the main research question or problem is the paper's aim is not directly supported by the sources. While Source 5 links the aim to the hypothesis, it does not explicitly equate the aim with the research question or problem itself. The other two claims, which are direct quotes and a list of sections, are fully supported by Source 1."
+        },
+        {
+          "question": "What methodology or methods were used?",
+          "answer": "The source material describes what should be included in the \"Material and Method(s)\" section of a scientific paper, rather than detailing specific methods used in a particular study.\n\nAccording to the provided sections (Source 2, Source 4):\n*   This section should describe, in a logical sequence, how the study was designed and carried out.\n*   It should identify who the participants were.\n*   It should specify what material and method was used.\n*   It should explain how the data were analysed a",
+          "faithfulness_score": 1.0,
+          "total_claims": 8,
+          "supported_claims": 8,
+          "unsupported_claims": [],
+          "explanation": "All factual claims in the answer are directly supported by the provided source chunks. The initial meta-claim about the nature of the source material is also accurate based on the content."
+        },
+        {
+          "question": "What are the key findings or results?",
+          "answer": "According to the provided source material, \"Results\" are defined as \"What was found?\" (Source 3, Preamble).\n\nThe sources describe how these findings or results should be presented:\n*   They are typically presented in tables and figures (Source 1, Preamble; Source 2, Preamble).\n*   Tables should present the essence of the results and establish the statistical validity of conclusions (Source 1, Preamble).\n*   Illustrations are used for emphasis of important points (Source 1, Preamble).\n*   A vast ",
+          "faithfulness_score": 1.0,
+          "total_claims": 10,
+          "supported_claims": 10,
+          "unsupported_claims": [],
+          "explanation": "All claims made in the answer are directly supported by the provided source chunks. Each claim accurately reflects information found in the specified sources."
+        },
+        {
+          "question": "What limitations does the paper mention?",
+          "answer": "The paper mentions two types of limitations:\n\n1.  **Limitations in previous research**: The introduction section should summarize what other people have done in the field, what limitations have been encountered to date, and what questions still need to be answered (Source 1, Section: Preamble; Source 4, Section: Preamble). This leads to stating the aim of the present study.\n2.  **Limitations of the present study**: A subsequent paragraph (likely in the discussion section, though not explicitly n",
+          "faithfulness_score": 1.0,
+          "total_claims": 5,
+          "supported_claims": 5,
+          "unsupported_claims": [],
+          "explanation": "All factual claims made in the answer are directly supported by the provided source chunks. The answer accurately identifies and describes two types of limitations mentioned in the sources: those in previous research (found in the introduction section) and those of the present study (found in a subsequent paragraph, likely discussion)."
+        },
+        {
+          "question": "What is the conclusion of the paper?",
+          "answer": "Based on the provided source material, the conclusion of the paper is that \"the IMRAD layout enables adequate and full presentation of scientific research\" (Source 1, Source 2, Section: Preamble).\n\nThe IMRAD layout allows authors to present:\n*   **Introduction:** What is known, what is not known, and why the study was done.\n*   **Material and Method:** Who the participants were, how the research was carried out, and how the results were evaluated.\n*   **Results:** What was found.\n*   **Discussio",
+          "faithfulness_score": 1.0,
+          "total_claims": 5,
+          "supported_claims": 5,
+          "unsupported_claims": [],
+          "explanation": "All factual claims in the answer are directly supported by the provided source chunks, specifically Source 1 and Source 2 for the overarching conclusion, and Source 1 for the detailed breakdown of each IMRAD section's content."
+        }
+      ],
+      "faithfulness_summary": {
+        "avg_faithfulness_score": 0.9339999999999999,
+        "total_claims_evaluated": 31,
+        "total_supported_claims": 30
+      }
+    }
+  },
+  "decomposition_ablation": {
+    "per_question": [
+      {
+        "question": "What methodology did the authors use, and what limitations did they mention?",
+        "hit_rate_without_decomposition": 0.6666666666666666,
+        "hit_rate_with_decomposition": 0.6666666666666666,
+        "sub_question_count": 2
+      },
+      {
+        "question": "What are the key findings, and how do they relate to the paper's stated research question?",
+        "hit_rate_without_decomposition": 0.8,
+        "hit_rate_with_decomposition": 0.8,
+        "sub_question_count": 2
+      },
+      {
+        "question": "What data or methods were used, and what conclusions did the authors draw from them?",
+        "hit_rate_without_decomposition": 0.6,
+        "hit_rate_with_decomposition": 0.6,
+        "sub_question_count": 1
+      }
+    ],
+    "avg_hit_rate_without_decomposition": 0.6888888888888888,
+    "avg_hit_rate_with_decomposition": 0.6888888888888888,
+    "delta": 0.0
+  }
+}
